@@ -1,0 +1,534 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.core import registry as _registry
+from app.core.models import Job
+from app.core.registry import _jobs
+from app.core.registry import persist as persist_registry
+from app.core.registry import restore as restore_registry
+
+
+@pytest.fixture(autouse=True)
+def _isolate_registry():
+    _jobs.clear()
+    _registry._pending_resume.clear()
+    yield
+    _jobs.clear()
+    _registry._pending_resume.clear()
+
+
+# ── resuming a queue across a restart ────────────────────────────────────────
+
+
+def _stems_dir(tmp_path: Path, job_id: str, names=("vocals", "drums")) -> None:
+    d = tmp_path / job_id / "stems"
+    d.mkdir(parents=True, exist_ok=True)
+    for n in names:
+        (d / f"{n}.wav").write_bytes(b"RIFF")
+    # As a separation that finished leaves them.
+    _registry.mark_stems_complete(tmp_path / job_id)
+
+
+def test_a_queued_job_survives_a_restart(tmp_path: Path):
+    """Only done jobs used to be persisted, so closing the app silently threw
+    away everything the user had queued."""
+    job = Job(id="abcdef000001", status="queued", title="Waiting", source_url="local:Waiting")
+    _jobs[job.id] = job
+
+    persist_registry(tmp_path)
+    _jobs.clear()
+    restore_registry(tmp_path)
+
+    assert _jobs[job.id].status == "queued"
+    assert _registry.take_pending_resume() == [job.id]
+
+
+def test_take_pending_resume_only_fires_once(tmp_path: Path):
+    _jobs["abcdef000001"] = Job(id="abcdef000001", status="queued", title="Waiting")
+    persist_registry(tmp_path)
+    _jobs.clear()
+    restore_registry(tmp_path)
+
+    assert _registry.take_pending_resume() == ["abcdef000001"]
+    assert _registry.take_pending_resume() == []
+
+
+def test_an_interrupted_job_whose_stems_landed_is_done_not_rerun(tmp_path: Path):
+    """The crash window between the last stem being written and the done-persist.
+    Re-running would duplicate the library entry and redo the whole separation."""
+    job = Job(id="abcdef000002", status="separating", title="Nearly done")
+    _jobs[job.id] = job
+    persist_registry(tmp_path)
+    _stems_dir(tmp_path, job.id)
+    _jobs.clear()
+
+    restore_registry(tmp_path)
+
+    assert _jobs[job.id].status == "done"
+    assert _registry.take_pending_resume() == []
+
+
+def test_an_interrupted_job_without_stems_is_requeued(tmp_path: Path):
+    job = Job(id="abcdef000003", status="separating", title="Half done", progress=0.6)
+    _jobs[job.id] = job
+    persist_registry(tmp_path)
+    _jobs.clear()
+
+    restore_registry(tmp_path)
+
+    restored = _jobs[job.id]
+    assert restored.status == "queued"
+    assert restored.progress == 0.0
+    assert _registry.take_pending_resume() == [job.id]
+
+
+@pytest.mark.parametrize("status", ["queued", "separating"])
+def test_restarts_of_a_queue_never_started_keep_every_job(tmp_path: Path, status: str):
+    """A restored queue waits, paused, for Start. Counting each restart as a
+    resume made the second restart without Start fail every job in it, and an
+    error is not saved, so they left the Library. A stale "separating" on disk
+    is no proof it ran: a status change mid-run is not saved."""
+    job = Job(id="abcdef000007", status=status, title="Waiting", source_url="local:Waiting")
+    _jobs[job.id] = job
+    persist_registry(tmp_path)
+
+    for _ in range(3):
+        _jobs.clear()
+        restore_registry(tmp_path)
+        assert _jobs[job.id].status == "queued"
+        assert _registry.take_pending_resume() == [job.id]
+
+
+def test_partial_demucs_output_is_cleared_before_a_resume(tmp_path: Path):
+    """collect() would otherwise mistake a half-written model dir for results."""
+    from app.core.config import DEMUCS_MODEL
+
+    job = Job(id="abcdef000004", status="separating", title="Half done")
+    _jobs[job.id] = job
+    persist_registry(tmp_path)
+    partial = tmp_path / job.id / DEMUCS_MODEL / "track"
+    partial.mkdir(parents=True)
+    (partial / "vocals.wav").write_bytes(b"partial")
+    _jobs.clear()
+
+    restore_registry(tmp_path)
+
+    assert not (tmp_path / job.id / DEMUCS_MODEL).exists()
+
+
+def test_a_job_interrupted_once_is_resumed(tmp_path: Path):
+    """Started once and the process died: its one resume. A record an older
+    version wrote with 1 after a single restart reads the same way."""
+    job = Job(id="abcdef000006", status="separating", title="Crashed", resume_attempts=1)
+    _jobs[job.id] = job
+    persist_registry(tmp_path)
+    _jobs.clear()
+
+    restore_registry(tmp_path)
+
+    assert _jobs[job.id].status == "queued"
+    assert _registry.take_pending_resume() == [job.id]
+
+
+def test_a_job_interrupted_twice_fails_instead_of_looping(tmp_path: Path):
+    """A job that reliably takes the process down would otherwise be re-queued
+    on every start, wedging the queue forever. Started twice, the resume
+    included, and the process died both times."""
+    job = Job(id="abcdef000005", status="separating", title="Poison", resume_attempts=2)
+    _jobs[job.id] = job
+    persist_registry(tmp_path)
+    _jobs.clear()
+
+    restore_registry(tmp_path)
+
+    assert _jobs[job.id].status == "error"
+    assert "again" in (_jobs[job.id].error or "")
+    assert _registry.take_pending_resume() == []
+
+
+def test_resumed_jobs_keep_their_original_order(tmp_path: Path):
+    for i, jid in enumerate(("abcdef00000a", "abcdef00000b", "abcdef00000c")):
+        _jobs[jid] = Job(id=jid, status="queued", title=f"T{i}", created_at=100.0 + i)
+    persist_registry(tmp_path)
+    _jobs.clear()
+
+    restore_registry(tmp_path)
+
+    assert _registry.take_pending_resume() == ["abcdef00000a", "abcdef00000b", "abcdef00000c"]
+
+
+def test_cancelled_and_errored_jobs_are_still_not_persisted(tmp_path: Path):
+    """Widening persistence to cover the queue must not resurrect dead jobs."""
+    _jobs["abcdef000006"] = Job(id="abcdef000006", status="cancelled", title="Nope")
+    _jobs["abcdef000007"] = Job(id="abcdef000007", status="error", title="Nope")
+    persist_registry(tmp_path)
+    _jobs.clear()
+
+    restore_registry(tmp_path)
+
+    assert _jobs == {}
+
+
+def test_persist_and_restore_terminal_job(tmp_path: Path):
+    job = Job(
+        id="abcdefabcdef",
+        status="done",
+        progress=1.0,
+        stage_message="Done",
+        title="Saved song",
+        stems=[{"name": "vocals", "url": "/api/jobs/abcdefabcdef/stems/vocals.wav"}],
+        selected_stems=["vocals"],
+    )
+    _jobs[job.id] = job
+
+    persist_registry(tmp_path)
+    _jobs.clear()
+    restore_registry(tmp_path)
+
+    restored = _jobs[job.id]
+    assert restored.status == "done"
+    assert restored.title == "Saved song"
+    assert restored.stems == job.stems
+    assert restored.cancel_requested is False
+
+
+def test_a_lead_backing_request_survives_a_restart(tmp_path: Path):
+    """#848: a job queued with Lead + Backing still asks for the split after
+    the app restarts, whether it was waiting or had finished."""
+    for job_id, status in (("abcdef000848", "queued"), ("abcdef001848", "done")):
+        _jobs[job_id] = Job(id=job_id, status=status, title="Asked", vocal_split_wanted=True)
+
+    persist_registry(tmp_path)
+    _jobs.clear()
+    restore_registry(tmp_path)
+
+    assert _jobs["abcdef000848"].vocal_split_wanted is True
+    assert _jobs["abcdef001848"].vocal_split_wanted is True
+
+
+def test_a_job_recovered_from_its_stems_keeps_the_lead_backing_request(tmp_path: Path):
+    """A crash after the last stem landed but before the done-persist rebuilds
+    the job from disk: the request must come with it."""
+    job = Job(id="abcdef003848", status="separating", title="Nearly", vocal_split_wanted=True)
+    _jobs[job.id] = job
+    persist_registry(tmp_path)
+    _stems_dir(tmp_path, job.id)
+    _jobs.clear()
+
+    restore_registry(tmp_path)
+
+    assert _jobs[job.id].status == "done"
+    assert _jobs[job.id].vocal_split_wanted is True
+
+
+def test_a_registry_from_before_the_lead_backing_request_loads_unchanged(tmp_path: Path):
+    """The registry 0.20.0 wrote has no vocal_split_wanted: its songs load as
+    "not asked for", without being set aside as damaged."""
+    fixture = Path(__file__).parent / "fixtures" / "upgrade-0.20.0" / "library" / "registry.json"
+    assert "vocal_split_wanted" not in fixture.read_text(encoding="utf-8")
+    (tmp_path / "registry.json").write_bytes(fixture.read_bytes())
+
+    restore_registry(tmp_path)
+
+    assert _jobs["0a20c0ffee01"].vocal_split_wanted is False
+    assert not list(tmp_path.glob("registry.json.bad-*"))
+
+
+def test_restore_recovers_orphan_done_job_from_stems(tmp_path: Path):
+    job_dir = tmp_path / "abcdefabcdee"
+    stems_dir = job_dir / "stems"
+    stems_dir.mkdir(parents=True)
+    (stems_dir / "vocals.wav").write_bytes(b"RIFF")
+    (stems_dir / "drums.wav").write_bytes(b"RIFF")
+    (job_dir / "metadata.json").write_text(json.dumps({"title": "Test Song"}), encoding="utf-8")
+
+    restore_registry(tmp_path)
+
+    restored = _jobs["abcdefabcdee"]
+    assert restored.status == "done"
+    assert restored.progress == 1.0
+    assert restored.title == "Test Song"
+    assert {stem["name"] for stem in restored.stems} == {"vocals", "drums"}
+
+
+def test_restore_recovers_automatic_sections_from_metadata(tmp_path: Path):
+    job_dir = tmp_path / "abcdefabc115"
+    stems_dir = job_dir / "stems"
+    stems_dir.mkdir(parents=True)
+    (stems_dir / "vocals.wav").write_bytes(b"RIFF")
+    sections = [{"id": "auto-001", "kind": "verse"}]
+    (job_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "title": "Structured Song",
+                "sections": sections,
+                "sections_source": "automatic",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    restore_registry(tmp_path)
+
+    restored = _jobs["abcdefabc115"]
+    assert restored.sections == sections
+    assert restored.sections_source == "automatic"
+
+
+def test_restore_recovers_orphan_without_metadata(tmp_path: Path):
+    """#284: a crash between the stems being marked complete and the metadata
+    write used to leave a complete stems dir permanently unrecoverable. Now it
+    comes back with a placeholder title, and a minimal metadata.json is written
+    so the next restart takes the normal recovery path (self-healing)."""
+    job_dir = tmp_path / "abcdefabcde0"
+    stems_dir = job_dir / "stems"
+    stems_dir.mkdir(parents=True)
+    (stems_dir / "vocals.wav").write_bytes(b"RIFF")
+    _registry.mark_stems_complete(job_dir)
+
+    restore_registry(tmp_path)
+
+    restored = _jobs["abcdefabcde0"]
+    assert restored.status == "done"
+    assert restored.title == "Recovered track abcdef"
+    assert {stem["name"] for stem in restored.stems} == {"vocals"}
+    # Self-healed: metadata.json now exists with the placeholder title.
+    meta = json.loads((job_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert meta["title"] == "Recovered track abcdef"
+
+
+def test_restore_recovers_lead_backing_vocals_and_marks_split_done(tmp_path: Path):
+    """#275: a job whose on-demand vocal split finished must not regress to
+    "never split" just because the process restarted before its next
+    registry persist -- both are derived straight from disk, same as the
+    base stems above."""
+    job_dir = tmp_path / "abcdefabc275"
+    stems_dir = job_dir / "stems"
+    stems_dir.mkdir(parents=True)
+    for name in ("vocals", "lead_vocals", "backing_vocals"):
+        (stems_dir / f"{name}.wav").write_bytes(b"RIFF")
+    (job_dir / "metadata.json").write_text(json.dumps({"title": "Split Song"}), encoding="utf-8")
+
+    restore_registry(tmp_path)
+
+    restored = _jobs["abcdefabc275"]
+    assert restored.vocal_split == "done"
+    assert {"lead_vocals", "backing_vocals"} <= {stem["name"] for stem in restored.stems}
+    # selected_stems (the mix-complement math) stays scoped to the base 6 --
+    # lead/backing are a further decomposition of vocals, not independent.
+    assert "lead_vocals" not in restored.selected_stems
+
+
+def test_restore_recovers_orphan_job_without_vocal_split(tmp_path: Path):
+    job_dir = tmp_path / "abcdefabc278"
+    stems_dir = job_dir / "stems"
+    stems_dir.mkdir(parents=True)
+    (stems_dir / "vocals.wav").write_bytes(b"RIFF")
+    (job_dir / "metadata.json").write_text(json.dumps({"title": "Unsplit Song"}), encoding="utf-8")
+
+    restore_registry(tmp_path)
+
+    assert _jobs["abcdefabc278"].vocal_split == "none"
+
+
+def test_restore_still_ignores_dir_without_stems(tmp_path: Path):
+    """The stems requirement stays: an empty/partial job dir is not a track."""
+    (tmp_path / "abcdefabcde1" / "stems").mkdir(parents=True)  # no WAVs
+    (tmp_path / "abcdefabcde2").mkdir(parents=True)  # no stems dir at all
+
+    restore_registry(tmp_path)
+
+    assert "abcdefabcde1" not in _jobs
+    assert "abcdefabcde2" not in _jobs
+
+
+def test_persist_concurrent_writers_no_corruption(tmp_path: Path):
+    """#281: pipeline thread, API threads, and the sweep all call persist()
+    concurrently. A shared temp path let writers collide (PermissionError on
+    Windows os.replace). Hammer it from threads: no exception, valid JSON,
+    no stray temp files."""
+    import threading
+
+    for i in range(5):
+        job = Job(id=f"abcdefabcd{i:02x}", status="done", title=f"t{i}")
+        _jobs[job.id] = job
+
+    errors: list[Exception] = []
+
+    def hammer():
+        try:
+            for _ in range(30):
+                persist_registry(tmp_path)
+        except Exception as e:  # pragma: no cover - the failure being tested
+            errors.append(e)
+
+    threads = [threading.Thread(target=hammer) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    data = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
+    assert len(data["jobs"]) == 5
+    assert not list(tmp_path.glob("*.tmp")), "no temp files may be left behind"
+    assert not list(tmp_path.glob(".registry.*")), "no temp files may be left behind"
+
+
+def test_restored_job_serves_stems(tmp_path: Path, monkeypatch):
+    stems_dir = tmp_path / "abcdefabcded" / "stems"
+    stems_dir.mkdir(parents=True)
+    (stems_dir / "vocals.wav").write_bytes(b"RIFF1234")
+    data = {
+        "version": 1,
+        "jobs": [
+            Job(
+                id="abcdefabcded",
+                status="done",
+                title="Test Song",
+                stems=[{"name": "vocals", "url": "/api/jobs/abcdefabcded/stems/vocals.wav"}],
+                selected_stems=["vocals"],
+            ).to_record()
+        ],
+    }
+    (tmp_path / "registry.json").write_text(json.dumps(data), encoding="utf-8")
+
+    monkeypatch.setattr("app.api.stems.JOBS_DIR", tmp_path)
+    monkeypatch.setattr("app.api.jobs.JOBS_DIR", tmp_path)
+    restore_registry(tmp_path)
+
+    from app.main import app
+
+    with TestClient(app) as client:
+        state = client.get("/api/jobs/abcdefabcded")
+        assert state.status_code == 200
+        assert state.json()["status"] == "done"
+        stem = client.get("/api/jobs/abcdefabcded/stems/vocals.wav")
+        assert stem.status_code == 200
+        assert stem.content == b"RIFF1234"
+
+
+def test_delete_updates_persisted_registry(tmp_path: Path, monkeypatch):
+    job = Job(id="abcdefabcdec", status="done")
+    _jobs[job.id] = job
+    job_dir = tmp_path / job.id
+    job_dir.mkdir(parents=True)
+    persist_registry(tmp_path)
+
+    monkeypatch.setattr("app.api.jobs.JOBS_DIR", tmp_path)
+
+    from app.main import app
+
+    with TestClient(app) as client:
+        response = client.delete(f"/api/jobs/{job.id}")
+
+    assert response.status_code == 200
+    assert not job_dir.exists()
+    data = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
+    assert data["jobs"] == []
+
+
+def test_a_reordered_queue_comes_back_in_the_users_order(tmp_path: Path):
+    """Order is the main thing a user controls in a serial queue, so it has to
+    survive a restart -- not fall back to submission order."""
+    from app.pipeline import jobqueue
+
+    ids = ["abcdef00000a", "abcdef00000b", "abcdef00000c"]
+    for i, jid in enumerate(ids):
+        job = Job(id=jid, status="queued", title=jid[-1], created_at=1000.0 + i)
+        _jobs[jid] = job
+        jobqueue.enqueue(jid)
+    # The user drags the last one to the front.
+    assert jobqueue.reorder("abcdef00000c", None) is True
+    persist_registry(tmp_path)
+
+    _jobs.clear()
+    _registry._pending_resume.clear()
+    jobqueue._queue.clear()
+    restore_registry(tmp_path)
+
+    assert _registry.take_pending_resume() == ["abcdef00000c", "abcdef00000a", "abcdef00000b"]
+
+
+def test_records_without_a_position_still_restore_oldest_first(tmp_path: Path):
+    """Registries written before reordering existed default to 0, where
+    created_at decides exactly as it used to."""
+    for i, jid in enumerate(["abcdef0000e1", "abcdef0000e2"]):
+        _jobs[jid] = Job(id=jid, status="queued", title=jid, created_at=2000.0 - i)
+    persist_registry(tmp_path)
+    _jobs.clear()
+    _registry._pending_resume.clear()
+
+    restore_registry(tmp_path)
+    assert _registry.take_pending_resume() == ["abcdef0000e2", "abcdef0000e1"]
+
+
+# ── a job trashed before the restart (#748) ──────────────────────────────────
+
+
+def test_a_trashed_interrupted_job_is_not_put_back_in_the_queue(tmp_path: Path):
+    """It came back as a Paused row offering to Start a song in the Trash."""
+    job = Job(id="abcdef0000f1", status="analyzing", title="Binned", trashed_at=1.0)
+    _jobs[job.id] = job
+    persist_registry(tmp_path)
+    (tmp_path / job.id).mkdir()
+    (tmp_path / job.id / "source.wav").write_bytes(b"RIFF")
+    _jobs.clear()
+
+    restore_registry(tmp_path)
+
+    assert _registry.take_pending_resume() == []
+    assert _jobs[job.id].status == "stopped"
+    assert (tmp_path / job.id / "source.wav").is_file(), "only emptying the Trash deletes files"
+
+
+def test_a_stopped_job_survives_a_restart_in_the_trash(tmp_path: Path):
+    """Not persisted, it would vanish from the Trash with its files orphaned."""
+    job = Job(id="abcdef0000f3", status="stopped", trashed_at=1.0)  # no title yet
+    _jobs[job.id] = job
+    persist_registry(tmp_path)
+    _jobs.clear()
+
+    restore_registry(tmp_path)
+
+    assert _jobs[job.id].status == "stopped"
+    assert _jobs[job.id].trashed_at == 1.0
+    assert _registry.take_pending_resume() == [], "only Extract may queue it again"
+
+
+def test_a_stopped_song_and_its_upload_survive_every_restart(tmp_path: Path):
+    """A song stopped in the Library (#772): never separated, its upload the only
+    copy. Two loads in a row, so the persist the first one ends with is read too."""
+    job = Job(id="abcdef0000f4", status="stopped", title="Kept", source_url="local:Kept")
+    _jobs[job.id] = job
+    persist_registry(tmp_path)
+    source = tmp_path / job.id / "source.mp3"
+    source.parent.mkdir()
+    source.write_bytes(b"ID3")
+
+    for _ in range(2):
+        _jobs.clear()
+        restore_registry(tmp_path)
+        assert _jobs[job.id].status == "stopped"
+        assert _jobs[job.id].trashed_at is None
+        assert _registry.take_pending_resume() == []
+        assert source.is_file()
+
+
+def test_a_trashed_job_that_finished_before_the_crash_stays_in_the_trash(tmp_path: Path):
+    job = Job(id="abcdef0000f2", status="separating", title="Binned", trashed_at=1.0)
+    _jobs[job.id] = job
+    persist_registry(tmp_path)
+    _stems_dir(tmp_path, job.id)
+    _jobs.clear()
+
+    restore_registry(tmp_path)
+
+    assert _jobs[job.id].status == "done"
+    assert _jobs[job.id].trashed_at == 1.0, "a song the user binned would reappear"
+    assert _registry.take_pending_resume() == []

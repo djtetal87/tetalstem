@@ -1,0 +1,145 @@
+TetalStem Linux Portable Alpha
+=============================
+
+This comes in two variants. Pick one:
+
+- TetalStem-Linux-x64.tar.gz         CPU-only (smaller; runs anywhere)
+- TetalStem-Linux-x64.NVIDIA.tar.gz  GPU: NVIDIA/CUDA, or AMD/ROCm (much faster
+                                    on a GPU, falls back to CPU if no GPU)
+
+Run
+---
+
+1. Extract the tarball, e.g.:
+     tar -xzf TetalStem-Linux-x64.tar.gz
+2. Install the runtime prerequisites (see below).
+3. Run the launcher:
+     cd TetalStem-Linux-x64        # or TetalStem-Linux-x64.NVIDIA
+     ./TetalStem
+4. Let first-run setup prepare local runtime assets.
+
+Nothing needs installing: this folder can be moved or deleted at will.
+
+Optional: add a desktop launcher
+--------------------------------
+
+If you would rather launch TetalStem from your applications menu than from a
+terminal, run the installer that ships in this folder:
+
+    ./install.sh
+
+It copies this folder to a fixed location and adds an icon and a menu entry.
+It never downloads anything; the version and the CPU/NVIDIA variant come from
+the package you already extracted.
+
+    ./install.sh --local        just me     (~/.local/opt/stemdeck)
+    ./install.sh --global       all users   (/opt/stemdeck, needs sudo)
+    ./install.sh --prefix DIR   somewhere else
+    ./install.sh --uninstall    remove it again
+    ./install.sh --help         all options
+
+To upgrade, extract the new tarball and run ./install.sh from it. It reuses the
+location you chose and replaces the old copy only once the new one is verified,
+so a failed upgrade leaves the working version alone.
+
+Uninstalling removes the application only. Your stem library and settings live
+outside the install directory and are never touched.
+
+Prerequisites
+-------------
+
+This portable package bundles its own Python runtime (torch + demucs), and
+TetalStem downloads FFmpeg automatically on first launch (or uses a system
+`ffmpeg` if one is already on your PATH). The only system libraries you need
+are your distro's WebKitGTK + GTK, which the desktop shell links against.
+
+Song identification with an AcoustID key also needs Chromaprint's fpcalc when
+your FFmpeg has no chromaprint support. TetalStem downloads it in the background
+on launch when it is needed; if that fails, songs are identified by their tags
+only. A distro package works too (Debian/Ubuntu: libchromaprint-tools,
+Fedora: chromaprint-tools, Arch: chromaprint).
+
+  Debian / Ubuntu:
+    sudo apt update
+    sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
+
+  Fedora:
+    sudo dnf install webkit2gtk4.1 gtk3
+
+  Arch:
+    sudo pacman -S webkit2gtk-4.1 gtk3
+
+NVIDIA variant
+--------------
+
+To use the GPU you need a working NVIDIA driver on the host such that
+`nvidia-smi` runs and reports your GPU.
+
+  Check your driver:
+    nvidia-smi
+
+On first launch, the NVIDIA build detects your GPU and downloads the matching
+CUDA-enabled PyTorch (a few GB) into your data directory — so the first run
+needs an internet connection and some disk space. You do NOT need a separate
+CUDA toolkit install, only the driver.
+
+If no usable GPU is detected, the NVIDIA build still runs and falls back to CPU.
+If you have neither an NVIDIA GPU nor a supported AMD GPU (see below), use the
+CPU-only tarball instead: it skips the GPU download entirely.
+
+AMD GPUs (same tarball, community-tested)
+-----------------------------------------
+
+Despite its name, the NVIDIA tarball also sets up an AMD GPU. When it finds no
+NVIDIA card, it looks for an AMD one through the amdgpu kernel driver and
+downloads the ROCm build of PyTorch (about 3-4 GB) on first launch. Nothing else
+needs installing: the ROCm runtime comes inside that download, so no ROCm
+packages from your distribution are needed.
+
+Supported: the cards the official ROCm build of PyTorch has kernels for, which
+includes the RX 9000 series (RDNA4), the RX 7000 series (RDNA3), the RX 6800 /
+6900 family (gfx1030) and Instinct accelerators. Cards outside that list stay
+on the CPU, and setup says so. With an integrated AMD GPU as well, the card
+ROCm supports is the one used.
+
+Your user needs read/write access to /dev/kfd, which is usually owned by the
+render group:
+
+    ls -l /dev/kfd
+    sudo usermod -aG render,video $USER    # then log out and back in
+
+Notes
+-----
+
+- This is a portable folder, not a system package. Running it in place creates
+  no .desktop entry, service, or package-manager integration; ./install.sh adds
+  a launcher and icon if you want them.
+- User data lives under $XDG_DATA_HOME/stemdeck (or ~/.local/share/stemdeck).
+- Your stem library is written to ~/Documents/TetalStem/.
+- Demucs model weights download from the backend on first use into the data
+  directory under models/.
+
+Troubleshooting
+---------------
+
+- "./TetalStem: error while loading shared libraries" — install the WebKitGTK
+  and GTK packages listed above.
+- A job failing immediately with an FFmpeg error — first-run setup downloads
+  FFmpeg automatically; check internet access and retry, or install a system
+  `ffmpeg` so `ffmpeg -version` works in your shell.
+- If setup fails, check internet access and retry.
+- TetalStem closes at once on Wayland, often with "Error 71 (Protocol error)
+  dispatching to Wayland display" or "Missing acquire timeline". This is
+  WebKitGTK's DMA-BUF renderer, mostly with the NVIDIA driver. TetalStem turns
+  that renderer off by itself on Wayland with NVIDIA, and after two launches
+  in a row that closed before their window loaded. That second switch is
+  tried again after 10 clean launches (20, 40, then at most 80 after each
+  retry that closed early), or when WebKitGTK or the NVIDIA driver changes.
+  Quitting normally in the first 5 seconds is not counted, and does not
+  reset the count. A logout or SIGTERM in those seconds does count; one of
+  them alone changes nothing. If it still closes, start it with:
+    WEBKIT_DISABLE_DMABUF_RENDERER=1 ./TetalStem
+  STEMDECK_WEBKIT_DMABUF=off turns the renderer off, =on keeps it on and
+  stops TetalStem from switching it, and =auto is the default.
+- Inspect logs under the data directory's logs/ folder.
+- Deleting the data directory forces first-run setup to recreate runtime state.

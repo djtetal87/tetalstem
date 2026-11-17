@@ -1,0 +1,105 @@
+// Shared, DOM-free job/library helpers used by both the mobile UI and
+// (incrementally) the desktop catalog. Anything in here must stay free of
+// document/window-element access so it can be imported from either entry
+// point. The API (`GET /api/jobs`) is the canonical data source.
+import { fmtTime } from "../utils.js";
+
+// Mirror of catalog.js PROCESSING_STATUSES — keep in sync with the backend
+// job lifecycle. These map to the amber "working" dot.
+const PROCESSING_STATUSES = new Set(["queued", "downloading", "analyzing", "separating", "processing"]);
+
+export async function fetchJobs() {
+  const res = await fetch("/api/jobs", { cache: "no-store" });
+  if (!res.ok) throw new Error(`GET /api/jobs -> ${res.status}`);
+  return res.json();
+}
+
+/** Library order (#772): oldest first by when the song was added, the order
+ *  the Queue runs them in, so the first song added is the first row. Takes
+ *  anything with `createdAt` (seconds) and `id`: a desktop track or a phone
+ *  card. Songs added in the same second fall back to their id, so the order
+ *  never depends on how the list happened to be stored. */
+export function compareOldestFirst(a, b) {
+  const byTime = (Number(a?.createdAt) || 0) - (Number(b?.createdAt) || 0);
+  if (byTime !== 0) return byTime;
+  const idA = String(a?.id ?? "");
+  const idB = String(b?.id ?? "");
+  return idA < idB ? -1 : idA > idB ? 1 : 0;
+}
+
+/** When a library row was added (seconds), the time the order above reads:
+ *  the job's created_at as the server sent it, whenever it has, so the Library
+ *  and the Queue order by one clock. The browser's clock can be skewed against
+ *  the server's (a Docker host), so `nowSec` only stamps a row the server has
+ *  not described yet, and the server's time replaces it once it arrives. */
+export function addedAt(serverCreatedAt, storedCreatedAt, nowSec = Date.now() / 1000) {
+  return serverCreatedAt ?? storedCreatedAt ?? nowSec;
+}
+
+export function deriveSource(sourceUrl) {
+  if (!sourceUrl) return "Local file";
+  if (sourceUrl.startsWith("local:")) return "Local file";
+  if (sourceUrl.includes("youtube.com") || sourceUrl.includes("youtu.be")) return "YouTube";
+  if (sourceUrl.includes("soundcloud.com")) return "SoundCloud";
+  return "Web";
+}
+
+// One of: "done" (green), "processing" (amber), "unavailable" (grey/red).
+export function statusKind(status) {
+  if (PROCESSING_STATUSES.has(status)) return "processing";
+  if (status === "done") return "done";
+  return "unavailable"; // unavailable / error / failed / unknown
+}
+
+export function coverInitial(title) {
+  const t = (title || "").trim();
+  return t ? t[0].toUpperCase() : "♪";
+}
+
+// Deterministic cover gradient: the same track always gets the same color.
+// Palette matches the mobile design's aesthetic (design/mobile prototype).
+const GRADIENTS = [
+  "linear-gradient(150deg,#7b46f0,#3f6ef0 55%,#1b245f)",
+  "linear-gradient(140deg,#2bd4c4,#1a6d9e)",
+  "linear-gradient(150deg,#c44ad0,#5a2b9e)",
+  "linear-gradient(150deg,#f06a6a,#7a2b4e)",
+  "linear-gradient(150deg,#4a9bf5,#2b3a7a)",
+  "linear-gradient(150deg,#f5a516,#d2541f)",
+  "linear-gradient(150deg,#3fcf6e,#1a6d4e)",
+];
+
+export function coverGradient(seed) {
+  const s = String(seed || "");
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return GRADIENTS[h % GRADIENTS.length];
+}
+
+// Normalize an /api/jobs state object into the shape the mobile UI renders.
+export function jobToCard(state) {
+  const id = state.job_id;
+  const title = state.title || "Untitled";
+  const stemCount = (state.stems || state.selected_stems || []).length;
+  const parts = [];
+  if (state.duration) parts.push(fmtTime(state.duration));
+  if (stemCount) parts.push(`${stemCount} stem${stemCount === 1 ? "" : "s"}`);
+  return {
+    id,
+    title,
+    sub: deriveSource(state.source_url),
+    meta: parts.join(" · "),
+    stemCount,
+    status: statusKind(state.status),
+    createdAt: state.created_at || 0,
+    initial: coverInitial(title),
+    gradient: coverGradient(id || title),
+    thumb: typeof state.thumbnail === "string" ? state.thumbnail : "",
+    // Carried through (not just derived into `sub`) so an "unavailable" card
+    // can be reimported without a second fetch for its own source URL/stems.
+    sourceUrl: state.source_url || null,
+    selectedStems: state.selected_stems || [],
+    // Kept on the server since #734, so a heart set on either screen shows on
+    // the other. null (never said) reads as not a favourite.
+    favorite: state.favorite === true,
+  };
+}

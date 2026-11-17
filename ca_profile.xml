@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CommunityApplications>
+  <Profile>
+    TetalStem splits any song into isolated stems (vocals, drums, bass, guitar,
+    piano, other) and plays them back in a DAW-style multitrack player, for
+    practice and transcription. This repository maintains the official TetalStem
+    self-hosted server container. For help, open an issue on GitHub.
+  </Profile>
+  <Icon>https://raw.githubusercontent.com/djtetal87/tetalstem/main/desktop/src-tauri/icons/icon.png</Icon>
+  <WebPage>https://github.com/djtetal87/tetalstem</WebPage>
+  <Forum>https://github.com/djtetal87/tetalstem/issues</Forum>
+</CommunityApplications>

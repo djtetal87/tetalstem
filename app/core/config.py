@@ -1,0 +1,1314 @@
+import json
+import logging
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
+
+logger = logging.getLogger("stemdeck.config")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        return default
+
+
+def _env_path(name: str, default: Path) -> Path:
+    raw = os.environ.get(name, "").strip()
+    return Path(raw).expanduser().resolve() if raw else default
+
+
+def _env_path_opt(name: str) -> Path | None:
+    """A path setting with no default: absent means the feature is off."""
+    raw = os.environ.get(name, "").strip()
+    return Path(raw).expanduser().resolve() if raw else None
+
+
+# Why torch could not be loaded at the last probe, or None if it loaded (#730).
+# Refreshed on every probe rather than decided once, so a repaired install
+# clears it without a restart.
+_torch_load_error: str | None = None
+
+
+def torch_load_error() -> str | None:
+    """The last probe's reason torch is installed but unusable, if any."""
+    return _torch_load_error
+
+
+def available_torch_devices() -> list[str]:
+    """Compute devices this machine can actually use, best-first. CPU is always
+    present; cuda/mps depend on the hardware + installed torch build. The
+    Settings UI uses this to disable options that aren't available/detected so
+    a user can't pick an impossible device."""
+    global _torch_load_error
+    devices: list[str] = []
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            devices.append("cuda")
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            devices.append("mps")
+        _torch_load_error = None
+    except ImportError:
+        pass
+    except Exception as exc:  # noqa: BLE001 -- any failure here must not stop the server
+        # Installed but unloadable: on Windows a CUDA DLL left behind by a
+        # half-reverted install raises OSError (WinError 127) from torch's own
+        # DLL loader (#723). Catching only ImportError let that kill startup
+        # and every /api/settings call. The server has to come up so it can
+        # say what is wrong. Logged loudly once per distinct cause, because
+        # separation cannot run on any device until torch is repaired, CPU
+        # included, and a quiet fallback would hide exactly that.
+        reason = f"{type(exc).__name__}: {exc}"
+        if reason != _torch_load_error:
+            logger.error("torch is installed but could not be loaded: %s", reason, exc_info=True)
+        _torch_load_error = reason
+    devices.append("cpu")
+    return devices
+
+
+def torch_gpu_backend(devices: list[str]) -> str | None:
+    """What drives the "cuda" device in `devices` (an available_torch_devices()
+    result): "cuda" for NVIDIA, "rocm" for AMD, None without one (#825).
+
+    A ROCm build of torch serves an AMD GPU through the same torch.cuda API, so
+    the device is "cuda" either way and every device setting, job record and
+    worker stays as it is; only what the user is shown has to tell them apart.
+    Read off the build (torch.version.hip is set on ROCm only), never by asking
+    the card: GPU work belongs to the worker processes. Takes the probe's
+    result rather than probing again."""
+    if "cuda" not in devices:
+        return None
+    import torch
+
+    return "rocm" if getattr(torch.version, "hip", None) else "cuda"
+
+
+def detect_torch_device() -> str:
+    """Best available Torch device for Demucs by hardware probe: cuda > mps >
+    cpu. Apple Silicon needs the explicit MPS check -- demucs's CLI default is
+    "cuda if available else cpu" and macOS has no CUDA, leaving the integrated
+    GPU idle and processing 3-5x slower than necessary.
+
+    User-facing device selection lives in app.core.settings (demucs_device,
+    default "auto" -> this probe); the STEMDECK_DEMUCS_DEVICE env var seeds
+    that setting's default so env-based deployments keep working."""
+    return available_torch_devices()[0]
+
+
+ROOT = Path(__file__).resolve().parent.parent.parent
+STATIC_DIR = ROOT / "static"
+# The click-sound presets (#805), defined once for the browser and the export
+# renderer: app/pipeline/click_sounds.py parses the JSON block in this file.
+CLICK_SOUNDS_TABLE = STATIC_DIR / "js" / "clickSounds.js"
+# The isolated click track's name in the stems zip (#805). Never a stem name:
+# asserted in app/api/stems.py, so the click cannot overwrite a stem's entry.
+CLICK_STEM_NAME = "click"
+STEM_NAMES: tuple[str, ...] = ("vocals", "drums", "bass", "guitar", "piano", "other")
+# Produced only when a job opts into the lead/backing vocal split (best-effort,
+# additive -- see app/pipeline/vocal_split.py). Kept out of STEM_NAMES itself:
+# selected_stems defaults, the "Original" complement-track math, and the
+# GET /api/config contract all assume "the 6 Demucs stems" and must not change
+# just because a job happened to request this extra pass.
+EXTRA_STEM_NAMES: tuple[str, ...] = ("lead_vocals", "backing_vocals")
+JOB_ID_RE = re.compile(r"^[a-f0-9]{12}\Z")
+# The file types an upload may be. A job keeps its upload as source<ext>.
+UPLOAD_EXTS = frozenset((".mp3", ".wav", ".flac", ".mp4", ".m4a", ".ogg", ".opus"))
+
+
+def _packaged_data_dir() -> Path | None:
+    """The data folder of a desktop package, found without being told.
+
+    The desktop shell always passes STEMDECK_DATA_DIR, so this only matters
+    when the backend is started some other way: by hand, from a terminal, out
+    of the package the shell would normally launch. That used to resolve
+    DATA_DIR to `backend/` itself, so the backend read a settings.json that did
+    not exist and ignored every choice the user had made in the app. Silent,
+    and it made a directly-run backend a different application with the same
+    files (#459).
+
+    Keyed on the layout every package shares -- `<package>/backend/app` here,
+    `<package>/data` beside it -- rather than on a marker file, because only
+    the Windows package writes one. A source checkout has ROOT named for the
+    repo and Docker has WORKDIR /app, so neither matches and neither changes.
+    """
+    if ROOT.name != "backend":
+        return None
+    candidate = ROOT.parent / "data"
+    return candidate if candidate.is_dir() else None
+
+
+# Runtime knobs -- env-backed so Docker / desktop packaging / local dev can
+# tune without a code edit. STEMDECK_DATA_DIR is the portable app root for
+# mutable runtime data; when unset, a package finds its own (above) and a plain
+# dev checkout stays on the repo-local jobs/ folder.
+_PACKAGED_DATA_DIR = _packaged_data_dir()
+PORTABLE_DATA_DIR_ENABLED = bool(
+    os.environ.get("STEMDECK_DATA_DIR", "").strip() or _PACKAGED_DATA_DIR
+)
+DATA_DIR = _env_path("STEMDECK_DATA_DIR", _PACKAGED_DATA_DIR or ROOT)
+
+
+def _stored_jobs_dir() -> Path | None:
+    """The stems location the user picked in Settings, if any.
+
+    Read straight out of settings.json rather than through app.core.settings,
+    which imports this module -- and it has to happen here because JOBS_DIR is
+    bound at import time across the app. Any problem reading it falls through to
+    the default: a library that quietly moves is far worse than one that ignores
+    a corrupt preference.
+    """
+    try:
+        raw = json.loads((DATA_DIR / "settings.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    value = raw.get("jobs_dir") if isinstance(raw, dict) else None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    path = Path(value).expanduser()
+    # Only honour a folder that is actually there. It existed when the user
+    # picked it, so a missing one means the disk holding it is not mounted --
+    # and ensure_runtime_dirs would otherwise happily mkdir it, which on macOS
+    # creates a real directory at the mount point on the boot disk and can stop
+    # the drive mounting under its own name later. Falling back to the default
+    # leaves the library findable again as soon as the disk is plugged in.
+    return path if path.is_dir() else None
+
+
+# Where extracted stems live. Precedence, most explicit first:
+#   1. STEMDECK_JOBS_DIR         -- a deployment that pinned it (Docker, Unraid,
+#                                   CI, tests). Wins over everything: a mounted
+#                                   volume is not the user's to relocate.
+#   2. settings.json             -- what the user chose in Settings (#354).
+#                                   Desktop only; the endpoint that writes it
+#                                   refuses to run anywhere else.
+#   3. STEMDECK_DEFAULT_JOBS_DIR -- the desktop shell's default
+#                                   (~/Documents/TetalStem/jobs). Passed as a
+#                                   default rather than a pin, so 2 can win.
+#   4. DATA_DIR/jobs             -- portable default
+#   5. <repo>/jobs               -- plain dev checkout
+JOBS_DIR = _env_path(
+    "STEMDECK_JOBS_DIR",
+    _stored_jobs_dir()
+    or _env_path(
+        "STEMDECK_DEFAULT_JOBS_DIR",
+        (DATA_DIR / "jobs") if PORTABLE_DATA_DIR_ENABLED else (ROOT / "jobs"),
+    ),
+)
+CACHE_DIR = _env_path("STEMDECK_CACHE_DIR", DATA_DIR / "cache")
+DOWNLOADS_DIR = _env_path("STEMDECK_DOWNLOADS_DIR", DATA_DIR / "downloads")
+MODELS_DIR = _env_path("STEMDECK_MODELS_DIR", DATA_DIR / "models")
+LOGS_DIR = _env_path("STEMDECK_LOGS_DIR", DATA_DIR / "logs")
+FFMPEG_DIR = _env_path("STEMDECK_FFMPEG_DIR", DATA_DIR / "ffmpeg")
+
+# ── TLS, for server deployments ───────────────────────────────────────────────
+#
+# AudioWorklet -- and so transpose -- is a [SecureContext] API, which browsers
+# grant to https:// and localhost and to nothing else. A phone on
+# http://<lan-ip> therefore cannot have it, and there is no workaround worth
+# shipping: driving the same DSP from a ScriptProcessorNode was measured
+# dropping ~5% of the audio, audibly, because that node type is lossy on its
+# own regardless of buffer size.
+#
+# Terminating TLS here costs nothing. uvicorn uses the stdlib `ssl` module, so
+# no package is added, uv.lock does not change, and the desktop in-app updater
+# is unaffected (see .claude/rules/desktop-update-gate.md). Generating a
+# certificate would need a dependency and would hand every client a full-page
+# browser warning, so TetalStem never does that: bring your own, from a reverse
+# proxy, Tailscale Serve, or mkcert.
+SSL_CERTFILE = _env_path_opt("STEMDECK_SSL_CERT")
+SSL_KEYFILE = _env_path_opt("STEMDECK_SSL_KEY")
+# The desktop app runs two listeners, not one: plain http on loopback for its
+# own webview, and https on the LAN for phones. It needs both because the two
+# have incompatible requirements -- the webview cannot be shown a certificate
+# warning it has no way to click through, and a phone cannot have transpose
+# without a secure origin. When this is set, app.main starts the second
+# listener alongside the first; when it is not, there is only ever one server
+# and TLS (if configured at all) belongs to whoever launched uvicorn.
+HTTPS_PORT = _env_int("STEMDECK_HTTPS_PORT", 0) or None
+# The address the desktop shell told uvicorn to bind: 127.0.0.1 while network
+# access is off, 0.0.0.0 while it is on (#859). None when anything else
+# started the server, which decides its own bind.
+BIND_HOST = os.environ.get("STEMDECK_BIND_HOST", "").strip() or None
+
+
+def _env_csv(name: str) -> tuple[str, ...]:
+    """A comma-separated list setting, lowercased, blanks dropped."""
+    raw = os.environ.get(name, "")
+    return tuple(part.strip().lower() for part in raw.split(",") if part.strip())
+
+
+# Extra names this server answers to, for the cross-site guard in
+# app/core/csrf.py: the public name of a reverse proxy, a Docker service name, a
+# Tailscale name. Host names only, a port is ignored; "*" accepts any Host.
+# When set, the Host check is strict even with network access on (see csrf.py).
+ALLOWED_HOSTS = _env_csv("STEMDECK_ALLOWED_HOSTS")
+FFMPEG_BIN = _env_path(
+    "STEMDECK_FFMPEG",
+    FFMPEG_DIR / ("ffmpeg.exe" if sys.platform.startswith("win") else "ffmpeg"),
+)
+FFPROBE_BIN = _env_path(
+    "STEMDECK_FFPROBE",
+    FFMPEG_DIR / ("ffprobe.exe" if sys.platform.startswith("win") else "ffprobe"),
+)
+# Chromaprint's fpcalc, for fingerprinting when the FFmpeg in use has no
+# chromaprint muxer (app/pipeline/fpcalc.py). The desktop shell downloads it
+# beside FFmpeg on macOS and Linux; elsewhere it is looked for beside the FFmpeg
+# in use, then on PATH.
+FPCALC_BIN = _env_path(
+    "STEMDECK_FPCALC",
+    FFMPEG_DIR / ("fpcalc.exe" if sys.platform.startswith("win") else "fpcalc"),
+)
+# JavaScript runtime for yt-dlp's YouTube challenge solver (#432). Portable
+# builds drop a binary here because nothing is on PATH in a portable install;
+# Docker ships deno on PATH and source checkouts have whatever the developer
+# installed, so both leave this directory absent and yt-dlp resolves its own.
+JS_RUNTIME_DIR = _env_path("STEMDECK_JS_RUNTIME_DIR", DATA_DIR / "jsruntime")
+
+# Ordered by yt-dlp's own JS challenge provider preference (deno 1000 >
+# node 900 > quickjs 850), so a build that ships more than one still gets the
+# solver yt-dlp would have picked itself.
+_JS_RUNTIME_BINARIES = (("deno", "deno"), ("node", "node"), ("quickjs", "qjs"))
+
+
+def _js_runtime_dirs() -> tuple[Path, ...]:
+    """Where a bundled JS runtime can live, in priority order.
+
+    Two layouts, because the packages are not built the same way. Windows and
+    Linux stage a whole tree and put the binary in `data/jsruntime`, which is
+    JS_RUNTIME_DIR's default. macOS downloads a runtime pack and keeps its own
+    data directory in ~/Library/Application Support, so the binary rides in the
+    pack next to `backend/` instead.
+
+    Checking both here rather than setting an env var from the desktop shell
+    keeps this a Python-side fact that can be tested, instead of a contract
+    split across two languages that only breaks on one platform.
+    """
+    dirs = [JS_RUNTIME_DIR]
+    # app/core/config.py -> app/core -> app -> backend/ (or the repo root).
+    backend_root = Path(__file__).resolve().parents[2]
+    dirs.append(backend_root / "jsruntime")
+    dirs.append(backend_root.parent / "jsruntime")
+    seen: set[Path] = set()
+    return tuple(d for d in dirs if not (d in seen or seen.add(d)))  # type: ignore[func-returns-value]
+
+
+def bundled_js_runtime() -> tuple[str, Path] | None:
+    """The JS runtime shipped with this install, as (yt-dlp name, path).
+
+    None when nothing is bundled, which is the normal case outside a packaged
+    build -- yt-dlp then falls back to its own PATH lookup, which is how Docker
+    finds the deno it ships. Never raises: a missing or unreadable directory
+    just means "not bundled".
+    """
+    suffix = ".exe" if sys.platform.startswith("win") else ""
+    for directory in _js_runtime_dirs():
+        try:
+            if not directory.is_dir():
+                continue
+            for name, stem in _JS_RUNTIME_BINARIES:
+                exe = directory / f"{stem}{suffix}"
+                if exe.is_file():
+                    return name, exe
+        except OSError:
+            continue
+    return None
+
+
+def js_solver_available() -> bool:
+    """Whether anything on this machine could run YouTube's challenge solver.
+
+    Used to explain a failure, never to gate one: yt-dlp does its own runtime
+    discovery and this is only a best-effort mirror of it. A false positive
+    just means the user gets the generic error instead of the specific one.
+    """
+    if bundled_js_runtime() is not None:
+        return True
+    return any(shutil.which(exe) for _, exe in _JS_RUNTIME_BINARIES)
+
+
+DEMUCS_MODEL = os.environ.get("STEMDECK_DEMUCS_MODEL", "htdemucs_6s").strip() or "htdemucs_6s"
+MAX_DURATION_SEC = max(60, _env_int("STEMDECK_MAX_DURATION_SEC", 1200))  # 20 min default
+JOB_TTL_SECONDS = max(300, _env_int("STEMDECK_JOB_TTL_SECONDS", 24 * 3600))  # 24 h default
+# The library list keeps each song's files-present answer until its stems
+# folder changes (#976), keyed on the folder's modification time. A folder
+# changed more recently than this is never trusted, because a filesystem that
+# keeps times coarsely could leave the time unchanged by a change in the same
+# tick. FAT keeps two seconds, so this never goes below that.
+_LIBRARY_RACY_WINDOW_FLOOR_MS = 2000
+
+
+def _library_racy_window_ns() -> int:
+    """STEMDECK_LIBRARY_RACY_WINDOW_MS, raised to the floor with a warning
+    when set below it: a smaller window would trust a folder time that a
+    coarse filesystem has not moved yet. Read once, at import."""
+    window_ms = _env_int("STEMDECK_LIBRARY_RACY_WINDOW_MS", 3000)
+    if window_ms < _LIBRARY_RACY_WINDOW_FLOOR_MS:
+        logger.warning(
+            "STEMDECK_LIBRARY_RACY_WINDOW_MS=%d is below the %d ms floor; using %d ms",
+            window_ms,
+            _LIBRARY_RACY_WINDOW_FLOOR_MS,
+            _LIBRARY_RACY_WINDOW_FLOOR_MS,
+        )
+        window_ms = _LIBRARY_RACY_WINDOW_FLOOR_MS
+    return window_ms * 1_000_000
+
+
+LIBRARY_RACY_WINDOW_NS = _library_racy_window_ns()
+# TTL for quarantined failed-job dirs (jobs/failed/<id>, kept for diagnostics).
+# Swept unconditionally -- even deployments with a persistent library must not
+# accumulate failure evidence forever.
+FAILED_TTL_SECONDS = max(3600, _env_int("STEMDECK_FAILED_TTL_SECONDS", 7 * 24 * 3600))  # 7 d
+# How long an export cache temp must have gone unwritten before the startup
+# sweep takes it. A second server that shares the cache folder (one started
+# with only STEMDECK_JOBS_DIR changed) may be writing it; an orphan is older.
+CACHE_TEMP_MIN_AGE_SECONDS = 600
+# Depth of the import queue: jobs waiting for their turn, not counting the one
+# running. Counted separately by kind, because the two cost wildly different
+# things. A queued upload holds its source file on disk for the whole wait, so
+# 20 of them is already an 8 GB worst case. A queued URL holds nothing at all --
+# it downloads when its turn comes -- so the only real cost is a registry
+# record, and a 50-track playlist should not have to be imported in batches.
+MAX_PENDING_UPLOAD_JOBS = max(1, min(200, _env_int("STEMDECK_MAX_PENDING_JOBS", 20)))
+MAX_PENDING_URL_JOBS = max(1, min(500, _env_int("STEMDECK_MAX_PENDING_URL_JOBS", 200)))
+# Ceiling on how much of a playlist one import may expand to. Enforced twice:
+# as yt-dlp's playlistend so nothing beyond it is ever fetched, and again after
+# normalization. Unrelated to MAX_PENDING_JOBS, which bounds the queue itself --
+# a playlist larger than the queue has room for fills what it can and says so.
+PLAYLIST_MAX_ITEMS = max(1, min(200, _env_int("STEMDECK_PLAYLIST_MAX_ITEMS", 50)))
+# Old songs waiting for their loudness to be measured again (api/jobs.py), at up
+# to TIMEOUT_ANALYZE each. One opened past this is measured on a later open.
+LOUDNESS_UPGRADE_QUEUE_MAX = 8
+TIMEOUT_FFMPEG = _env_int("STEMDECK_TIMEOUT_FFMPEG", 300)
+TIMEOUT_ANALYZE = _env_int("STEMDECK_TIMEOUT_ANALYZE", 120)
+TIMEOUT_DEMUCS_STALL = _env_int("STEMDECK_TIMEOUT_DEMUCS_STALL", 1800)
+# The separation model's first download (#125). A network that opens the
+# connection and then sends nothing used to hold the first Split for the whole
+# 30-minute stall limit above. A read gives up after this many seconds without
+# a byte, the file is tried this many times with these pauses between tries,
+# and a worker silent this long while it downloads is stopped. The worker says
+# each failed try on stderr, which resets that limit, so its own error, which
+# names the file and the folder, usually arrives first; when the limit fires
+# instead (a host whose addresses each swallow the connection, say), the job's
+# error names them too.
+TIMEOUT_MODEL_DOWNLOAD_READ = max(1, _env_int("STEMDECK_TIMEOUT_MODEL_DOWNLOAD_READ", 30))
+MODEL_DOWNLOAD_ATTEMPTS = max(1, _env_int("STEMDECK_MODEL_DOWNLOAD_ATTEMPTS", 3))
+MODEL_DOWNLOAD_BACKOFF = (2, 5)
+_MODEL_MIRROR_DEFAULT = "https://files.stemdeck.app"
+
+
+def parse_model_mirror(raw: str | None) -> str | None:
+    """The base address of the model mirror (app/core/model_download.py), or
+    None for no mirror. Unset means the default mirror; an empty value turns
+    the mirror off. Only an https address with a host and no user name,
+    password, query or fragment is used: anything else is refused with a
+    warning and the mirror is off, so a mistyped setting never sends a
+    download somewhere unverified by TLS. The files are checked against their
+    full SHA-256 either way; https keeps who answers honest too."""
+    if raw is None:
+        return _MODEL_MIRROR_DEFAULT
+    raw = raw.strip()
+    if not raw:
+        return None
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(raw)
+        port_ok = parts.port is None or 0 < parts.port < 65536
+    except ValueError:
+        parts, port_ok = None, False
+    if (
+        parts is None
+        or not port_ok
+        or parts.scheme != "https"
+        or not parts.hostname
+        or parts.username is not None
+        or parts.password is not None
+        or "?" in raw
+        or "#" in raw
+        or any(seg in (".", "..") for seg in parts.path.split("/"))
+        or "\\" in raw
+        or any(ch.isspace() for ch in raw)
+    ):
+        logger.warning("STEMDECK_MODEL_MIRROR is not an https address; the model mirror is off")
+        return None
+    return raw.rstrip("/")
+
+
+# Where the separation model is fetched from first (app/core/model_download.py),
+# before its original host. Read once, at import, like every setting here.
+MODEL_MIRROR = parse_model_mirror(os.environ.get("STEMDECK_MODEL_MIRROR"))
+TIMEOUT_MODEL_STALL = max(1, _env_int("STEMDECK_TIMEOUT_MODEL_STALL", 120))
+# Minutes with no separation or analysis running before the idle Demucs
+# worker is stopped and the beat model dropped (#975); 0 never unloads. The worker exists to skip a model
+# load per job (#309), so this trades memory for the next job's start: measured
+# on an RTX 3080, 2026-11-05, a 3 min 53 s song: the idle CUDA worker held
+# 1.93 GB of RAM and 1.11 GB of VRAM (CPU worker: 1.46 GB of RAM), and the
+# first separation after an unload took 5.8 s longer (9.9 s against 15.7 s).
+# Ten minutes keeps a run of imports warm and gives the memory back once the
+# user has stopped. The Settings value wins over the environment.
+IDLE_UNLOAD_MINUTES_MAX = 1440
+
+
+def _env_idle_unload_minutes() -> int:
+    return max(0, min(IDLE_UNLOAD_MINUTES_MAX, _env_int("STEMDECK_IDLE_UNLOAD_MINUTES", 10)))
+
+
+IDLE_UNLOAD_MINUTES = _env_idle_unload_minutes()
+# How often the idle timer looks. An unload lands at most this late.
+IDLE_UNLOAD_CHECK_SEC = 30
+# Automatic functional-section analysis. Inference stays on CPU because the
+# persistent Demucs worker deliberately keeps its model resident on the chosen
+# accelerator between jobs; loading a second model beside it would make VRAM
+# use depend on GPU size and the preceding job. The ensemble name remains
+# configurable for deployments evaluating a different compatible checkpoint.
+SECTION_MODEL = os.environ.get("STEMDECK_SECTION_MODEL", "harmonix-all").strip() or "harmonix-all"
+TIMEOUT_SECTIONS = max(60, _env_int("STEMDECK_TIMEOUT_SECTIONS", 30 * 60))
+TIMEOUT_SECTIONS_STALL = max(30, _env_int("STEMDECK_TIMEOUT_SECTIONS_STALL", 120))
+# Conservative evidence gates for the section refiner. The first real-song
+# diagnostic found that the upstream decoder emitted 13 Come As You Are spans
+# but our equal-label merge hid six boundaries. It also found a suppressed
+# 0.059 activation inside the intro with only 0.18 embedding novelty. Requiring
+# 0.05 activation and 0.35 novelty preserves strong independent evidence
+# without turning each instrumental entrance into a new functional section.
+SECTION_REFINEMENT_GRID_MIN_CONFIDENCE = 70
+SECTION_REFINEMENT_BEAT_SNAP_SECONDS = 0.12
+SECTION_REFINEMENT_MIN_ACTIVATION = 0.05
+SECTION_REFINEMENT_MIN_NOVELTY = 0.35
+SECTION_REFINEMENT_NOVELTY_WINDOW_SECONDS = 8.0
+SECTION_REFINEMENT_MIN_SEGMENT_SECONDS = 6.0
+# The test track's disputed 49.85-65.89 span had a 0.045 Verse/Chorus margin,
+# while the surrounding accepted semantic spans were at least 0.10. A weak
+# tie becomes neutral Part rather than a confidently wrong functional label.
+SECTION_REFINEMENT_MIN_LABEL_MARGIN = 0.08
+SECTION_REFINEMENT_RECURRENCE_SIMILARITY = 0.85
+SECTION_REFINEMENT_RECURRENCE_LABEL_MARGIN = 0.25
+# On-demand lead/backing vocal split (#275). UVR-MDX-NET Karaoke 2 is an
+# officially-distributed UVR-project model (MIT + credit-to-UVR per the
+# audio-separator README) -- the default. STEMDECK_KARAOKE_MODEL lets a
+# deployment swap the checkpoint (e.g. to a roformer model) without a code
+# change; see docs/models.md for the license audit behind this default.
+VOCAL_SPLIT_MODEL = os.environ.get("STEMDECK_KARAOKE_MODEL", "").strip() or "UVR_MDXNET_KARA_2.onnx"
+# A first run downloads the checkpoint (hundreds of MB); generous default so a
+# slow connection isn't mistaken for a stall.
+TIMEOUT_VOCAL_SPLIT = _env_int("STEMDECK_TIMEOUT_VOCAL_SPLIT", 1800)
+# How often the split's stall watchdog looks. Coarse on purpose: the timeout
+# above is half an hour.
+VOCAL_SPLIT_WATCHDOG_POLL_SEC = 30
+# Beat-grid stage decodes the whole drums stem (not the 180 s analyze window),
+# so it gets its own, larger budget.
+TIMEOUT_BEATGRID = _env_int("STEMDECK_TIMEOUT_BEATGRID", 300)
+
+# Recorded takes (docs: audio capture). A take is a folder under
+# jobs/<job_id>/takes/<take_id>/ and lives and dies with the job folder.
+TAKE_ID_RE = re.compile(r"^t[0-9a-f]{8}\Z")
+TAKES_DIRNAME = "takes"
+# One job can hold this many takes, finished or not. A bound on disk use by a
+# client that creates takes in a loop, not a musical limit.
+TAKE_MAX_PER_JOB = 50
+# Recording tracks (DAW-style): a track is one mixer lane that owns takes and
+# plays its active one. Stored in takes/tracks.json beside the take folders.
+TRACK_ID_RE = re.compile(r"^k[0-9a-f]{8}\Z")
+TRACKS_FILE = "tracks.json"
+TRACK_MAX_PER_JOB = 32
+# A video take's filmstrip (GET .../takes/{id}/filmstrip): one sprite of
+# frames, this tall, at most this many, from ffmpeg within this long.
+FILMSTRIP_FRAME_HEIGHT = 72
+FILMSTRIP_MAX_FRAMES = 240
+TIMEOUT_FILMSTRIP = _env_int("STEMDECK_TIMEOUT_FILMSTRIP", 120)
+# A part body is capped by the 4 MB JSON body middleware in app/main.py; the
+# route checks the same number while it streams the body, because the header
+# can be absent or wrong.
+TAKE_PART_MAX_BYTES = 4 * 1024 * 1024
+TAKE_MAX_SEQ = 100_000
+# Total size per kind is bounded by the song: its duration plus this much
+# slack (count-in, pickup notes, a late Stop), at the largest capture format.
+TAKE_SLACK_SEC = 120
+TAKE_AUDIO_MAX_BYTES_PER_SEC = 48000 * 2 * 4  # float32 stereo at 48 kHz
+TAKE_CAMERA_MAX_BYTES_PER_SEC = 20_000_000 // 8  # 20 Mbit/s, 2.5x the 8 Mbit/s recorder
+
+# Effects chain prints (Advanced mode, static/js/fx/fxPrint.js): the browser
+# renders a lane through its effects chain and uploads it, in parts under the
+# 4 MB body limit, and the export uses it in place of the stem. Stored in the
+# cache folder, never the jobs folder: a print is derived and can be made again.
+FX_PRINT_PART_MAX_BYTES = 4 * 1024 * 1024
+FX_PRINT_MAX_SEQ = 2_000
+# A print is the lane's length plus the chain's tail, capped at this many
+# seconds (TAIL_CAP_SEC in static/js/fx/chainModel.js), plus one second of
+# slack for rounding.
+FX_PRINT_TAIL_MAX_SEC = 4
+FX_PRINT_SLACK_SEC = 1
+# The chain key the browser sends (chainModel.canonicalChain): eight pedals
+# of a dozen controls each fit in well under this.
+FX_PRINT_CHAIN_MAX_CHARS = 8192
+# The print folder's budget, oldest first. A five minute stereo print is about
+# 80 MB at 24 bits.
+FX_PRINT_CACHE_MAX_FILES = 40
+FX_PRINT_CACHE_MAX_BYTES = 3 * 1024 * 1024 * 1024
+# An upload that never finished is removed after this long.
+FX_PRINT_SESSION_TTL_SEC = 3600
+# Streamer Mode's recorder asks for at most 70% of that (recordModel.js
+# BITRATE_MAX), so a busy scene's overshoot still fits.
+# A take render's output: the canvas's short side for each size it offers.
+# No 4K (the maintainer's decision): a 1080p camera only gets bigger, at a
+# large cost in encode time and memory.
+CANVAS_SHORT_SIDES = {"720": 720, "1080": 1080}
+# The click's level in a take render: the export's default (stems.py).
+RENDER_CLICK_GAIN = 0.6
+# A backing track without one stem (app/pipeline/backing.py): a sum of five
+# WAVs, seconds for a song; the ceiling only guards a stuck disk.
+TIMEOUT_BACKING = _env_int("STEMDECK_TIMEOUT_BACKING", 120)
+
+# How a finished song's stems are kept on disk (#783): "wav" (16-bit PCM, as
+# separated) or "mp3" (CBR libmp3lame at one of STEM_MP3_KBPS_CHOICES). The
+# default for an install with no saved choice and no env var. One line to
+# change. 128 kbps is the maintainer's choice: stems summed again in the
+# mixer carry the coding noise of each one.
+DEFAULT_STEM_STORAGE: tuple[str, int] = ("mp3", 128)
+STEM_FORMAT_CHOICES: tuple[str, ...] = ("wav", "mp3")
+STEM_MP3_KBPS_CHOICES: tuple[int, ...] = (128, 192, 256)
+# The MP3 step at the end of the pipeline (app/pipeline/stem_storage.py): one
+# ffmpeg per stem, a few seconds each. Terminated when ffmpeg is silent this
+# long; the song then keeps its WAVs.
+TIMEOUT_STEM_TRANSCODE_STALL = _env_int("STEMDECK_TIMEOUT_STEM_TRANSCODE_STALL", 120)
+# Video render of a take (libx264 + AAC). Slower than any audio export: a
+# 5-minute 1080p30 encode runs about 1x to 3x realtime on a desktop CPU, and a
+# small NAS or laptop CPU can be several times slower than realtime. Bounded by
+# this many seconds per second of video, within the floor and the ceiling (the
+# floor wins): a flat bound cut a long take short on a slow CPU.
+TIMEOUT_VIDEO_RENDER = _env_int("STEMDECK_TIMEOUT_VIDEO_RENDER", 3600)
+TIMEOUT_RENDER_MAX = _env_int("STEMDECK_TIMEOUT_RENDER_MAX", 6 * 3600)
+VIDEO_RENDER_SEC_PER_SEC = 6.0
+
+# The take render's hardware (GPU) H.264 encoders (app/pipeline/video_encoder.py).
+# libx264 stays the default and the fallback for every failure. h264_mf
+# (Windows Media Foundation) is deliberately absent: it refused 4K on the test
+# machine and has no constant-quality mode.
+VIDEO_CPU_ENCODER = "libx264"
+VIDEO_GPU_ENCODERS = ("h264_nvenc", "h264_qsv", "h264_amf", "h264_vaapi", "h264_videotoolbox")
+# The setting's values: "auto" tries the GPU encoders, "cpu" never does, an
+# encoder name tries only that one.
+VIDEO_ENCODER_CHOICES = ("auto", "cpu", *VIDEO_GPU_ENCODERS)
+
+
+def _env_choice(name: str, choices: tuple[str, ...]) -> str:
+    """An env value from a fixed list, lowercased; "" when unset or unknown."""
+    raw = os.environ.get(name, "").strip().lower()
+    return raw if raw in choices else ""
+
+
+# STEMDECK_VIDEO_ENCODER=cpu is the kill switch: it wins over the setting.
+# Any other choice ("auto", an encoder name) also wins; "" leaves the setting.
+VIDEO_ENCODER_OVERRIDE = _env_choice("STEMDECK_VIDEO_ENCODER", VIDEO_ENCODER_CHOICES)
+
+
+def _env_render_node(name: str) -> str:
+    """A DRM render node from the env ("renderD129" or "/dev/dri/renderD129")
+    as its full path; "" when unset. Anything else is ignored with a warning,
+    so a typo never reaches an ffmpeg command."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return ""
+    match = re.fullmatch(r"(?:/dev/dri/)?(renderD[0-9]+)", raw)
+    if match is None:
+        logger.warning(
+            "%s=%r is not a render node such as renderD128 or /dev/dri/renderD128; ignored",
+            name,
+            raw[:64],
+        )
+        return ""
+    return f"/dev/dri/{match.group(1)}"
+
+
+# h264_vaapi tries every /dev/dri/renderD* node in number order and uses the
+# first whose test encode passes (#995: on a hybrid-GPU machine the first node
+# can be the one without a working encoder). STEMDECK_VAAPI_DEVICE pins it to
+# one node instead, with no other node tried; that node missing means no VAAPI.
+VAAPI_DEVICE_OVERRIDE = _env_render_node("STEMDECK_VAAPI_DEVICE")
+
+# A probe is a real 2 s encode of a test picture at the render's size and rate.
+VIDEO_ENCODER_PROBE_SEC = 2
+TIMEOUT_VIDEO_ENCODER_PROBE = _env_int("STEMDECK_TIMEOUT_VIDEO_ENCODER_PROBE", 20)
+# `ffmpeg -encoders` for the audio export capabilities (app/pipeline/
+# audio_encoders.py). Runs once per ffmpeg binary and returns in well under a
+# second; the bound only matters for an ffmpeg that hangs.
+TIMEOUT_AUDIO_ENCODER_LIST = _env_int("STEMDECK_TIMEOUT_AUDIO_ENCODER_LIST", 15)
+# `ffmpeg -filters`, asked once per ffmpeg binary whether it has rubberband,
+# which a transposed export needs (app/pipeline/audio_encoders.py, #858).
+TIMEOUT_AUDIO_FILTER_LIST = _env_int("STEMDECK_TIMEOUT_AUDIO_FILTER_LIST", 15)
+# `nvidia-smi`, asked why separation runs on the CPU (app/core/device_reason.py,
+# #247). About 0.2 s on an RTX 3080; the first call can take seconds while an
+# Optimus laptop wakes its GPU. The answer is kept for NVIDIA_SMI_TTL_SEC, since
+# Settings asks on every open and a GPU does not come and go within minutes.
+TIMEOUT_NVIDIA_SMI = _env_int("STEMDECK_TIMEOUT_NVIDIA_SMI", 10)
+NVIDIA_SMI_TTL_SEC = 300
+# How long a probe result is trusted. A pass for a week, a failure for a day (a
+# driver installed today is tried tomorrow, or at once with Test encoders), a
+# timeout or a busy device for ten minutes (never as a lasting answer).
+VIDEO_ENCODER_PASS_TTL_SEC = 7 * 24 * 3600
+VIDEO_ENCODER_FAIL_TTL_SEC = 24 * 3600
+VIDEO_ENCODER_RETRY_SEC = 600
+# Failed GPU renders before that encoder is left alone until the next start.
+VIDEO_ENCODER_MAX_FAILURES = 2
+# A GPU render whose progress has not moved for this long is stopped and made
+# again on the CPU (a hung driver never ends on its own).
+TIMEOUT_VIDEO_GPU_STALL = _env_int("STEMDECK_TIMEOUT_VIDEO_GPU_STALL", 60)
+# The check of a GPU file: a full decode, bounded by this floor or this many
+# seconds per second of video, whichever is longer.
+TIMEOUT_VIDEO_VALIDATE_MIN = _env_int("STEMDECK_TIMEOUT_VIDEO_VALIDATE", 120)
+VIDEO_VALIDATE_SEC_PER_SEC = 1.0
+VIDEO_VALIDATE_DURATION_TOL_SEC = 0.5
+# The Settings "Test encoders" run: every candidate at 1080p30 and 4K30,
+# stopped when this much time has gone.
+VIDEO_ENCODER_TEST_BUDGET_SEC = 150
+# The GPU encoders' bitrate ceiling, in bits per pixel per frame (31 Mbps at
+# 1080p30, 124 Mbps at 4K30). Measured on the RTX 3080: NVENC at cq 19 spent
+# 0.5 to 0.9 Mbps on a real 1080p scene take (libx264 crf 20: 0.34) with a
+# higher SSIM, and on pure noise topped out near 35 Mbps whatever the cap, so
+# the cap only guards a runaway file.
+VIDEO_GPU_MAX_BITS_PER_PIXEL = 0.5
+
+# Ceilings of the limiter at the end of every mixdown (export clipping fix).
+# Stems summed at unity measured +0.9 dBFS with 77 clipped samples on a real
+# song (docs/plans 01-mastering 3.3).
+#
+# Lossless exports (WAV, FLAC): a sample-peak limit at -1 dBFS, idle and
+# bit-identical below it. Measured on two real songs with +6 dB boosts, a
+# hot take, transpose and click: sample peak -1.0 dBFS, true peak -0.6 dBTP
+# at worst, no sample at full scale, also after resampling to 48 kHz.
+EXPORT_LIMIT_DBFS = -1.0
+# Lossy exports (MP3, OGG, the AAC in an MP4): the encoder adds peak on top
+# of its input (MP3 measured +0.7 dB in the same document, 4.1), so the
+# limit is a true-peak one (4x oversampled) and lower. Measured on the same
+# songs: decoded peaks -0.9 to -1.3 dBTP, where the -1 dBFS sample limit
+# left -0.4 dBTP for MP3 and OGG and +0.4 dBFS (clipped) for AAC.
+EXPORT_LIMIT_LOSSY_DBTP = -1.5
+
+# Every loudness meter (ffmpeg's ebur128) is run with this framelog level.
+# Without one, ebur128 logs a line per 100 ms frame at "info". "verbose" moves
+# those lines below ffmpeg's default "info" level, so only the summary and any
+# printed metadata reach stderr. Not "quiet": ffmpeg 6.1 knows that value but
+# 5.1 (Debian 12, the oldest TetalStem runs on: MIN_FFMPEG_VERSION in
+# app/pipeline/audio_encoders.py) does not, and it rejects the whole filter
+# graph, so nothing is measured at all.
+EBUR128_FRAMELOG = "verbose"
+
+# Reading an upload's tags (artist, title, album, lyrics) with ffprobe for the
+# Lyrics tab and the artist box (#699). Tags are a nicety, so a probe that
+# takes longer than this is abandoned and the upload goes ahead without them.
+TIMEOUT_PROBE_TAGS = _env_int("STEMDECK_TIMEOUT_PROBE_TAGS", 15)
+# Looking up a finished link's tags after the fact, for tracks imported before
+# tags were read: one yt-dlp metadata request (two if YouTube's bot check sends
+# it back for cookies), no download. Past this the lookup answers "nothing
+# found" rather than keep the page waiting.
+TIMEOUT_FETCH_TAGS = _env_int("STEMDECK_TIMEOUT_FETCH_TAGS", 45)
+# Caps on what a tag may carry into the job record, which is rewritten whole
+# on every save: a name longer than this is not a name, and a lyrics tag
+# longer than this is not lyrics.
+AUDIO_TAG_MAX_CHARS = 300
+AUDIO_TAG_LYRICS_MAX_CHARS = 20000
+# An upload's tags written in a Windows codepage but read as Latin-1 (an MP3's
+# ID3v1 tag, or an ID3v2 frame marked ISO-8859-1): "zapomnia³em" for
+# "zapomniałem", "Êèíî" for "Кино". The codepages tried when re-reading
+# them, Central European then Cyrillic. See _repair_encoding in
+# app/pipeline/audio_tags.py for when a re-reading is taken.
+AUDIO_TAG_LEGACY_CODEPAGES = ("cp1250", "cp1251")
+# A word of at least this many letters, every one of them accented Latin, is
+# taken as mis-decoded ("Êèíî"). Real names this short made only of accents
+# exist ("ÆØÅ"), so three letters is not evidence on its own.
+AUDIO_TAG_MOJIBAKE_MIN_WORD = 4
+
+# Finding the band a job's artist tag names, on Wikidata, while the job is
+# separated (#699), so the artist box and the Lyrics tab have it the moment the
+# import is done. Two requests, each abandoned after this many seconds. The
+# lookup runs beside separation, which takes far longer, so it costs an import
+# no time unless both requests are slow and the separation was fast.
+TIMEOUT_ARTIST_LOOKUP = _env_int("STEMDECK_TIMEOUT_ARTIST_LOOKUP", 8)
+# Wikimedia asks every client to name itself and a way to reach its maker.
+ARTIST_LOOKUP_USER_AGENT = (
+    "TetalStem (https://github.com/djtetal87/tetalstem; self-hosted stem separation)"
+)
+# A search and one entity fetch for its hits come to well under this; an
+# answer bigger than it is not one worth parsing.
+ARTIST_LOOKUP_MAX_BYTES = 8 * 1024 * 1024
+
+# Which recording a job is, found while it separates (app/pipeline/identify.py).
+#
+# AcoustID: an audio fingerprint of the first FINGERPRINT_LENGTH_SEC seconds
+# (fpcalc's default length), made with ffmpeg's chromaprint muxer (or fpcalc,
+# FPCALC_BIN, where that FFmpeg has none), looked up with the user's own API
+# key. Only runs when the user set one in Settings. TIMEOUT_FINGERPRINT bounds
+# either one.
+ACOUSTID_LOOKUP_URL = "https://api.acoustid.org/v2/lookup"
+# A key is tried once when it is saved (identify.acoustid_key_works), so a key
+# AcoustID refuses is caught in Settings rather than failing every import in
+# silence. 0 turns the check off, for the browser tests, which must never
+# reach AcoustID.
+ACOUSTID_CHECK_KEY = _env_int("STEMDECK_ACOUSTID_CHECK_KEY", 1) != 0
+# Discogs: the user's own personal access token, set in Settings, for band
+# profiles Wikipedia does not cover. A token is tried once when it is saved
+# (discogs_auth.discogs_token_works), as an AcoustID key is, so one Discogs
+# refuses is caught in Settings. 0 turns the check off, for the browser tests,
+# which must never reach Discogs. The check is abandoned after
+# TIMEOUT_DISCOGS_CHECK seconds a read, and twice that in all.
+DISCOGS_IDENTITY_URL = "https://api.discogs.com/oauth/identity"
+DISCOGS_CHECK_TOKEN = _env_int("STEMDECK_DISCOGS_CHECK_TOKEN", 1) != 0
+TIMEOUT_DISCOGS_CHECK = _env_int("STEMDECK_TIMEOUT_DISCOGS_CHECK", 8)
+FINGERPRINT_LENGTH_SEC = 120
+# Decoding two minutes of audio for the fingerprint takes about a second; past
+# this the fingerprint is abandoned and identification goes on without it.
+TIMEOUT_FINGERPRINT = _env_int("STEMDECK_TIMEOUT_FINGERPRINT", 30)
+# AcoustID's score is how closely the fingerprints agree, 0..1. The same
+# recording scores well above 0.9; a different mix or a live cut of the song
+# lands far lower. Kept high because the answer is saved with nobody looking.
+ACOUSTID_MIN_SCORE = 0.8
+# AcoustID allows three requests a second per client.
+ACOUSTID_MIN_INTERVAL_SEC = 0.34
+# MusicBrainz: one request a second per client, and every client names itself
+# with a way to reach its maker, or it is throttled harder.
+MUSICBRAINZ_API = "https://musicbrainz.org/ws/2"
+MUSICBRAINZ_MIN_INTERVAL_SEC = 1.0
+
+
+def _musicbrainz_user_agent() -> str:
+    try:
+        from app._version import version
+
+        release = str(version).split("+", 1)[0] or "dev"
+    except Exception:
+        release = "dev"
+    return f"TetalStem/{release} ( https://github.com/djtetal87/tetalstem )"
+
+
+MUSICBRAINZ_USER_AGENT = _musicbrainz_user_agent()
+# MusicBrainz sheds load with 503 (and now and then 429) even to a client
+# keeping to its rate: measured on 2026-09-27, four of 45 benchmark songs lost
+# their identity to a single 503. A refused request is asked again up to this
+# many times, waiting MUSICBRAINZ_RETRY_BACKOFF_SEC, then twice that, and so
+# on, or what Retry-After asks, never more than MUSICBRAINZ_RETRY_MAX_WAIT_SEC.
+MUSICBRAINZ_RETRIES = 3
+MUSICBRAINZ_RETRY_BACKOFF_SEC = 1.0
+MUSICBRAINZ_RETRY_MAX_WAIT_SEC = 8.0
+# The most one request may take, its retries and their waits included: past
+# it, a request still being refused gives up, so a run of busy answers never
+# holds a lookup (and the shared queue behind it) for a minute.
+MUSICBRAINZ_REQUEST_BUDGET_SEC = 20.0
+# A request that would wait longer than this for its turn under the rate
+# limit is not made at all: a queue that long means something else is
+# hammering the service, and identification is best-effort.
+RATE_LIMIT_MAX_WAIT_SEC = 15
+# A search by name is kept only when MusicBrainz scores it at least this
+# (0..100) and its length is within IDENTIFY_DURATION_TOLERANCE_SEC of the
+# track's: a name alone can be anybody's song, the length says which.
+MUSICBRAINZ_SEARCH_MIN_SCORE = 90
+IDENTIFY_DURATION_TOLERANCE_SEC = 4
+# A track its tags do not name (a YouTube upload with no music metadata) is
+# looked for by its title (app/pipeline/title_parse.py): up to this many
+# readings of it on MusicBrainz, then, when none is confident, on LRCLIB.
+TITLE_MUSICBRAINZ_SEARCHES = 3
+TITLE_LRCLIB_SEARCHES = 2
+# A recording found that way is kept only when its credit and release titles
+# (or LRCLIB's artist and album) contain at least this share of the title's
+# words beyond the song's name: the performers, the show.
+TITLE_MIN_COVERAGE = 0.5
+# When no reading's words are found in a credit, the artist a reading names is
+# looked up on MusicBrainz by name and alias, which finds 周杰倫 from "Jay
+# Chou", IU from "아이유" and 鄧麗君 from "邓丽君", and the song is searched for
+# among that artist's recordings: for up to this many readings, two requests
+# each.
+TITLE_ARTIST_SEARCHES = 2
+# A music video runs longer than the recording on the album: an intro, a
+# story, credits. Among the recordings of an artist found by name, one this
+# much shorter than the upload still counts, the nearest length first.
+# Measured on 2026-09-27: IU's "Good Day" video is 124 seconds longer than
+# the single, BTS "Spring Day" 55, Jay Chou's "Sunny Day" 49.
+IDENTIFY_VIDEO_EXTRA_SEC = 150
+# Each AcoustID or MusicBrainz request is abandoned after this many seconds.
+TIMEOUT_IDENTIFY_REQUEST = _env_int("STEMDECK_TIMEOUT_IDENTIFY_REQUEST", 8)
+# How long a finished pipeline waits for identification still in flight.
+# Separation takes minutes, so the answer is nearly always waiting already.
+IDENTIFY_GRACE_SEC = _env_int("STEMDECK_IDENTIFY_GRACE_SEC", 2)
+# POST /api/jobs/{id}/audio-tags identifies an older track before it answers;
+# past this it answers with what it has.
+TIMEOUT_IDENTIFY_BACKFILL = _env_int("STEMDECK_TIMEOUT_IDENTIFY_BACKFILL", 60)
+# A lookup answer bigger than this is not one worth parsing.
+IDENTIFY_MAX_BYTES = 4 * 1024 * 1024
+# MusicBrainz answers kept on disk, one file per recording or artist MBID, so
+# re-identifying a track (a re-split, a backfill) asks nothing twice.
+MUSICBRAINZ_CACHE_DIR = CACHE_DIR / "musicbrainz"
+MUSICBRAINZ_CACHE_TTL_SEC = 30 * 24 * 3600
+# Discogs band profiles (app/pipeline/discogs.py), for bands Wikipedia has no
+# article on, asked only with the user's own token (settings.discogs_token).
+# Discogs allows 60 requests a minute to a client with a token, so one a
+# second across the process. Each request is abandoned after
+# TIMEOUT_DISCOGS_REQUEST seconds; a 429 (or a 502/503) is asked again up to
+# DISCOGS_RETRIES times, waiting what Retry-After says up to
+# DISCOGS_RETRY_MAX_WAIT_SEC, never past DISCOGS_REQUEST_BUDGET_SEC for the
+# one request. GET /api/jobs/{id}/artist-extra gives the whole lookup (a
+# search, a few releases to check, the artist and its releases: about seven
+# requests) DISCOGS_LOOKUP_BUDGET_SEC before it answers without.
+DISCOGS_API = "https://api.discogs.com"
+DISCOGS_MIN_INTERVAL_SEC = 1.0
+TIMEOUT_DISCOGS_REQUEST = _env_int("STEMDECK_TIMEOUT_DISCOGS_REQUEST", 8)
+DISCOGS_RETRIES = 2
+DISCOGS_RETRY_BACKOFF_SEC = 2.0
+DISCOGS_RETRY_MAX_WAIT_SEC = 10.0
+DISCOGS_REQUEST_BUDGET_SEC = 20.0
+DISCOGS_LOOKUP_BUDGET_SEC = _env_int("STEMDECK_DISCOGS_LOOKUP_BUDGET_SEC", 45)
+# A name typed in the artist box, searched on Discogs (GET /api/discogs/artist):
+# the search and the profiles of its first few artists, one a second, so the
+# user can tell "Nihil (2)" from "Nihil (5)". What is not in by then is left
+# out rather than waited for.
+DISCOGS_SEARCH_BUDGET_SEC = _env_int("STEMDECK_DISCOGS_SEARCH_BUDGET_SEC", 15)
+# An artist's release list at 100 a page is well under a megabyte.
+DISCOGS_MAX_BYTES = 2 * 1024 * 1024
+# Answers kept on disk, one file per request, as MusicBrainz's are.
+DISCOGS_CACHE_DIR = CACHE_DIR / "discogs"
+DISCOGS_CACHE_TTL_SEC = 30 * 24 * 3600
+# The work behind a soundtrack or cast recording (app/pipeline/work_lookup.py):
+# the musical, film or series a job's song is from, found on Wikidata beside
+# the band. Past this many seconds the tag backfill answers without it.
+TIMEOUT_WORK_BACKFILL = _env_int("STEMDECK_TIMEOUT_WORK_BACKFILL", 30)
+# How far up Wikidata's "subclass of" a work's class is followed to find a
+# kind of work it is. Three reaches "animated television series" from
+# "anime television series"; further only finds classes too broad to mean it.
+WORK_CLASS_DEPTH = 3
+# A cast recording comes out months after the show opens, and a soundtrack
+# can come out a little before its film. A work first shown more than this
+# many years after the recording came out cannot be what it is from.
+WORK_YEAR_SLACK = 1
+
+# A job's lyrics, found on LRCLIB (lrclib.net) while it separates and kept
+# beside its stems as LYRICS_FILE (app/pipeline/lyrics_lookup.py). LRCLIB asks
+# clients to name themselves and link their homepage.
+LRCLIB_API = "https://lrclib.net/api"
+LRCLIB_USER_AGENT = (
+    "TetalStem (https://github.com/djtetal87/tetalstem; self-hosted stem separation)"
+)
+LYRICS_FILE = "lyrics.json"
+# When LRCLIB was asked and no version was kept: the versions it had, for the
+# tab to offer, and when it was asked. The tag backfill does not ask again for
+# LYRICS_NOT_FOUND_RETRY_SEC; lyrics.json from any source settles it for good.
+LYRICS_CANDIDATES_FILE = "lyrics_candidates.json"
+LYRICS_NOT_FOUND_RETRY_SEC = _env_int("STEMDECK_LYRICS_NOT_FOUND_RETRY_DAYS", 30) * 24 * 3600
+# Each request is abandoned after this many seconds; /api/get can be slow when
+# LRCLIB has to look further afield for an exact match.
+TIMEOUT_LYRICS_LOOKUP = _env_int("STEMDECK_TIMEOUT_LYRICS_LOOKUP", 10)
+# No further request is started this many seconds into a lookup. The cascade
+# is at most five requests, and all of them run beside separation.
+LYRICS_LOOKUP_BUDGET_SEC = _env_int("STEMDECK_LYRICS_LOOKUP_BUDGET_SEC", 30)
+# LRCLIB answers 503 or 429 when it is busy, for a moment. Each request is
+# asked again this many times, waiting LYRICS_LOOKUP_RETRY_SEC and then twice
+# that, within the lookup's budget, so one busy moment does not cost a song
+# its lyrics.
+LYRICS_LOOKUP_RETRIES = 2
+LYRICS_LOOKUP_RETRY_SEC = 1.0
+# How long a finished pipeline waits for a lookup still in flight. Short for
+# the same reason as the band's: the tab looks for lyrics itself when a track
+# has none.
+LYRICS_LOOKUP_GRACE_SEC = _env_int("STEMDECK_LYRICS_LOOKUP_GRACE_SEC", 2)
+# How long the lookup waits for the identification running beside it (a
+# fingerprint, then MusicBrainz at one request a second) before it goes by the
+# tags instead. Both run beside separation, so the wait costs an import nothing.
+LYRICS_IDENTITY_WAIT_SEC = _env_int("STEMDECK_LYRICS_IDENTITY_WAIT_SEC", 60)
+# A search answers at most 20 versions of a few kilobytes each.
+LYRICS_LOOKUP_MAX_BYTES = 8 * 1024 * 1024
+# LRCLIB lengths come from real releases, so the same recording lands within a
+# second or two; a live cut or a radio edit does not. The page's
+# SAME_RECORDING_SEC and SAME_LENGTH_SEC (static/js/lyrics*.js).
+LYRICS_SAME_RECORDING_SEC = 3
+# Other versions kept beside the one chosen, for the tab to offer.
+LYRICS_OTHERS_MAX = 11
+# Moving the timing of lyrics from a version of another length onto the track
+# (app/pipeline/lyrics_align.py): the shifts tried, how near a line's start the
+# voice's rise is looked for, and how clear the best shift must be: this many
+# standard deviations above all shifts, this many times the best shift a
+# second or more away, and this share of the lines on a rise of the voice.
+# Measured on six library tracks' vocals stems against their LRCLIB versions:
+# the same recording scored z 5.1 to 7.3, 1.24 to 1.48 and 66 to 94% of lines
+# (two songs of even, repeating lines scored 1.06 and stay unverified); a
+# different performance of the song z 2.7, 1.03, 55%; scattered synthetic
+# singing at most z 4.9, 1.33, 35%.
+LYRICS_ALIGN_MAX_OFFSET_SEC = 60
+LYRICS_ALIGN_TOLERANCE_SEC = 0.2
+LYRICS_ALIGN_MIN_LINES = 6
+LYRICS_ALIGN_MIN_Z = 4.5
+LYRICS_ALIGN_MIN_RATIO = 1.15
+LYRICS_ALIGN_MIN_HITS = 0.6
+# LRCLIB's version the track's own length ("timing": "exact") is checked the
+# same way, and moved only when the voice clearly starts at least this much
+# later or earlier: a copy of the right length can still be timed to another
+# cut (Green Day "Basket Case": the video's lines start 16 s after the copy's).
+LYRICS_ALIGN_EXACT_MIN_SHIFT_SEC = 1.0
+# How long deleting a job waits for its lyrics timing to stop and let go of
+# the vocals stem (the worker is terminated, then killed after 5 s).
+RETIME_DELETE_WAIT_SEC = 15
+# How far the Lyrics tab's Align panel may move a track's lyrics, either way
+# ("offset_sec" in lyrics.json, POST /api/jobs/{id}/lyrics/offset): a long
+# intro or a medley's later verse, and no further.
+LYRICS_OFFSET_MAX_SEC = 600
+# Lyrics timed line by line to the singing (app/pipeline/lyrics_retime.py).
+# The words Whisper heard in the vocals are kept beside lyrics.json in this
+# file, so timing them again costs no second pass.
+LYRICS_TRANSCRIPT_FILE = "lyrics_transcript.json"
+# The result is kept only when at least this share of the lyrics' syllables
+# was matched to heard words, and this share of the lines anchored where they
+# are sung. Measured on 58 songs in ten languages: every one timed well
+# matched 0.48 or more and anchored 0.52 or more of its lines; the timings
+# that must not be kept (a romanised Japanese copy, a remix's lyrics, German
+# transcribed as English, a transcription led astray by a prompt of the
+# lyrics) matched 0.00 to 0.26 and anchored 0.00 to 0.32.
+LYRICS_RETIME_MIN_MATCHED = 0.35
+LYRICS_RETIME_MIN_LINES_SHARE = 0.45
+# The alignment's size cap, lyric tokens times heard tokens: its back
+# pointers take two bytes a cell. A long Chinese song is about 1500 x 1500.
+LYRICS_RETIME_MAX_CELLS = 12_000_000
+# A manual timing (PUT .../lyrics/user-synced) has at most this many lines,
+# and it or a line-by-line timing at most this many characters: word stamps
+# add ten a word to lyrics of up to 100000.
+LYRICS_USER_SYNCED_MAX_LINES = 2000
+LYRICS_TIMED_MAX_CHARS = 400_000
+# Lyrics that lost their letters outside ASCII, mended from a reference that
+# has them (app/pipeline/lyrics_repair.py). A copy with no intact twin on
+# LRCLIB is checked against the audio only when it has at least this many
+# words, none with such a letter, and fewer than this share of them common
+# English words. Measured on LRCLIB copies: four English songs (171 to 676
+# words) scored 0.23 to 0.27 on that list, eleven Polish copies (Kukulska,
+# Kayah, Bisz, stripped or not) 0.
+LYRICS_STRIPPED_CHECK_MIN_WORDS = 40
+LYRICS_STRIPPED_ENGLISH_MAX_SHARE = 0.1
+# Then Whisper decides the language from the vocals, and only a language
+# written with such letters, detected with at least this probability, goes
+# on to a transcription. Languages written in another script are left out:
+# a copy of theirs in Latin letters is a transliteration, which a
+# transcription cannot mend.
+LYRICS_REPAIR_LANGUAGES = frozenset(
+    [
+        "pl",
+        "cs",
+        "sk",
+        "sl",
+        "hr",
+        "bs",
+        "hu",
+        "ro",
+        "tr",
+        "de",
+        "fr",
+        "pt",
+        "es",
+        "ca",
+        "gl",
+        "it",
+        "vi",
+        "lt",
+        "lv",
+        "et",
+        "fi",
+        "is",
+        "fo",
+        "da",
+        "no",
+        "nn",
+        "sv",
+        "sq",
+        "mt",
+        "lb",
+    ]
+)
+LYRICS_REPAIR_MIN_LANGUAGE_PROB = 0.8
+# And the transcription must bear it out: at least this many words given
+# their letters back, this share of the words paired with what Whisper heard,
+# and this share of those pairs given letters. A song written without accents
+# in any of those languages pairs the same way and gives back next to none.
+LYRICS_REPAIR_MIN_RESTORED = 5
+LYRICS_REPAIR_MIN_ALIGNED = 0.4
+LYRICS_REPAIR_MIN_RESTORED_SHARE = 0.1
+# A word no sure pair covered (a chorus the transcription skipped, a word
+# beside a misheard one) takes the spelling the song's sure pairs gave it
+# elsewhere, when they gave it only that one, at least this many times, and
+# never kept it as it is. On "W biegu" 1 mends 49 words against 46 for 2, the
+# three being repeats of "biegne", "cigle" and "pno" whose other occurrence
+# was heard.
+LYRICS_REPAIR_VOCABULARY_MIN = 1
+# The in-order pairing is quadratic: words times reference words beyond this
+# are not paired at all (a song is a few hundred of each).
+LYRICS_REPAIR_ALIGN_MAX_CELLS = 4_000_000
+
+# Lyrics transcribed from the vocals stem with Whisper when no lookup found
+# any (app/pipeline/transcribe.py). Whether it runs is the transcribe_lyrics
+# setting. Weights download on first use into <TORCH_HOME>/whisper, beside the
+# Demucs checkpoints, and are verified by Whisper's own SHA-256 check.
+#
+# large-v3-turbo on a GPU: large-v3's encoder with a 4-layer decoder, 1.6 GB.
+# small on a CPU, or on a GPU without room for turbo: 0.5 GB.
+TRANSCRIBE_MODEL_GPU = os.environ.get("STEMDECK_WHISPER_MODEL_GPU", "").strip() or "turbo"
+TRANSCRIBE_MODEL_CPU = os.environ.get("STEMDECK_WHISPER_MODEL_CPU", "").strip() or "small"
+# Free VRAM the GPU model needs, checked in the worker before loading, since
+# the Demucs worker keeps its own allocation resident on the same card.
+# Measured on an RTX 3080 (Nirvana "Lithium", 255 s): turbo held in fp16
+# peaked at 2172 MB reserved by torch, 2463 MB on the card with the CUDA context.
+TRANSCRIBE_GPU_MIN_FREE_MB = _env_int("STEMDECK_WHISPER_GPU_MIN_FREE_MB", 3072)
+# Below this, even the small model is not tried on the GPU and runs on the CPU.
+TRANSCRIBE_SMALL_GPU_MIN_FREE_MB = _env_int("STEMDECK_WHISPER_SMALL_GPU_MIN_FREE_MB", 1536)
+# The whole stage, including a first-run model download on a slow connection.
+TIMEOUT_TRANSCRIBE = max(60, _env_int("STEMDECK_TIMEOUT_TRANSCRIBE", 30 * 60))
+# No output for this long is a hang. Whisper reports progress once per 30 s
+# window of audio, which the small model on a CPU finishes well inside it.
+TIMEOUT_TRANSCRIBE_STALL = max(30, _env_int("STEMDECK_TIMEOUT_TRANSCRIBE_STALL", 300))
+# Vocals quieter than this, as stem_presence (0-100, relative to the loudest
+# stem), are not worth transcribing: Whisper invents words over silence. A stem
+# that is absent from a track measured 0-2 across six library tracks.
+TRANSCRIBE_MIN_VOCAL_PRESENCE = 3
+# Skip silent stretches longer than this around a suspected hallucination
+# (Whisper's hallucination_silence_threshold). An isolated vocal has long
+# instrumental gaps, which is where Whisper makes up text.
+TRANSCRIBE_HALLUCINATION_SILENCE_SEC = 2.0
+# Lines are Whisper's segments, broken further at a pause at least this long
+# between two words, and at a comma or a pause once a line is this many
+# characters long. Nothing is ever longer than the hard cap.
+TRANSCRIBE_LINE_BREAK_GAP_SEC = 0.8
+TRANSCRIBE_LINE_SOFT_CHARS = 40
+TRANSCRIBE_LINE_HARD_CHARS = 64
+# A gap between two words at least this long is written as an end stamp, so
+# the karaoke wipe waits through it instead of stretching the first word.
+TRANSCRIBE_WORD_GAP_SEC = 0.3
+# A silence at least this long between two lines starts a new stanza (a blank
+# line) in the plain text.
+TRANSCRIBE_STANZA_GAP_SEC = 4.0
+
+# Beat-grid analysis parameters. 22050 Hz is plenty for onset detection (the
+# percussive energy that matters lives well under 11 kHz) and keeps the decode
+# cheap; hop 512 gives ~23 ms grid resolution, the librosa default pairing.
+# Which beat detector the grid stage uses.
+#   "auto"    -- the neural model when it is importable and its weights are
+#                available, otherwise librosa. The shipping default.
+#   "model"   -- require the model; fail the stage rather than silently
+#                degrading. For diagnosing packaging problems.
+#   "librosa" -- force the classic tracker. Kept because it needs no model
+#                download and no network.
+#
+# The model is not a nicety. librosa's `beat_track` carries a lognormal tempo
+# prior centred on 120 BPM, so a 180 BPM punk track resolves to 90 and the
+# click plays half-time -- measured on Green Day "Welcome To Paradise"
+# (detected 90.0, true ~180) and reproduced on synthetic punk at 176 (detected
+# 117.5). No confidence metric catches it: a half-time grid puts a real drum
+# hit under every beat and scores 94%.
+BEAT_DETECTOR = os.environ.get("STEMDECK_BEAT_DETECTOR", "").strip().lower() or "auto"
+if BEAT_DETECTOR not in ("auto", "model", "librosa"):
+    BEAT_DETECTOR = "auto"
+# beat_this checkpoint name; resolved through torch.hub, so it lands under
+# TORCH_HOME (which configure_portable_environment points at MODELS_DIR).
+BEAT_MODEL_CHECKPOINT = os.environ.get("STEMDECK_BEAT_MODEL", "").strip() or "final0"
+
+BEATGRID_SR = 22050
+BEATGRID_HOP = 512
+# Interior gaps: the model only emits beats where it hears them, so a section
+# with no drums leaves a hole -- 5.26 s on the Welcome To Paradise breakdown,
+# where the drums stem RMS drops to 0.008 against 0.098 for the whole stem. A
+# click that stops for five seconds reads as a bug, so gaps that are a clean
+# multiple of the local period are subdivided at that period. Both endpoints
+# are real detected beats, so the filled beats cannot drift out of the section.
+# How far the implied period (gap / inserted-beat count) may sit from the local
+# period. Judged per inserted beat, not across the whole gap. 0.15 fills the
+# 5.26 s Welcome To Paradise hole (residual 3.1%) while refusing a 1.54x
+# interval, which at 0.35 was being split into two beats 23% too fast -- audible
+# as a stumble rather than a repair.
+BEATGRID_GAP_FILL_MAX_RESIDUAL = 0.15
+BEATGRID_GAP_LOCAL_WINDOW = 8  # intervals either side used for the local period
+# Gap filling, the grid-consistency pass and edge extension all assume a locally
+# regular pulse. On genuinely irregular material they do harm: on Dance of
+# Eternity they inserted 85 beats and "corrected" 269 of 1059, wrecking a grid
+# the detector had tracked adequately.
+#
+# The gate is interquartile range over median interval, NOT the coefficient of
+# variation. A single drum-free section inflates cv enormously while the pulse
+# either side is perfectly steady -- Welcome To Paradise measures cv 0.535 and
+# IQR/median 0.054. Measured: 0.054 (regular punk with one 5 s hole), 0.025
+# (steady rock), 0.531 (108 time-signature changes). A 10x separation, so the
+# threshold sits comfortably in the middle.
+BEATGRID_MAX_IRREGULARITY = 0.20
+# Phase check. A tracker can land the right tempo on the wrong half of the beat,
+# putting every click in a gap between hits -- measured on a bare repeated-kick
+# pattern where the whole grid sat in silence and refinement rejected all 45
+# beats for having no transient to snap to. Shifting the grid by half a beat is
+# accepted only when it improves onset support by this factor, so a grid that is
+# already correct (where off-beat hi-hats give the wrong phase *some* support)
+# is never flipped.
+BEATGRID_PHASE_FLIP_RATIO = 2.0
+# Beat times out of librosa land on the 512-hop grid, i.e. quantised to ~23 ms.
+# A click carrying that error flams audibly against the drums, so beats are
+# refined against a much finer onset envelope (~2.9 ms) and then parabolically
+# interpolated to sub-frame precision. The search window is deliberately under
+# half a coarse hop: wide enough to correct quantisation, far too narrow to
+# drag a beat onto a neighbouring sixteenth.
+BEATGRID_REFINE_HOP = 32
+# Temporal precision is set by the analysis *window*, not the hop: onset_strength
+# defaults to a 2048-sample (93 ms) FFT, which smears a transient far too much to
+# localise it. 512 samples (23 ms) with 64 mel bands measured a 0.19 ms standard
+# deviation against synthetic transients, versus 4.8 ms at the default. Dropping
+# n_mels alongside n_fft avoids empty mel filters at this resolution.
+BEATGRID_REFINE_NFFT = 512
+BEATGRID_REFINE_MELS = 64
+# Must comfortably exceed half the coarse hop (~11.6 ms) or the true peak falls
+# outside the search window and refinement makes things *worse* than it found
+# them -- measured 10.9 ms worst-case error at a 20 ms window versus 2.0 ms at
+# 30 ms, because the coarse quantisation phase beats against the beat interval
+# and periodically pushes the true peak past the edge. 30 ms stays under a
+# sixteenth note (50 ms) even at the 300 BPM ceiling, so it can never snap to a
+# neighbouring subdivision. Widening beyond 30 ms measured identically, so this
+# is the knee, not a guess.
+BEATGRID_REFINE_WINDOW = 0.030  # seconds, floor for the search window
+# Both the search window and the move limit scale with the beat interval, because
+# what they have to correct is detector error, and that is a fraction of a beat
+# rather than a fixed number of milliseconds. Fixed 30 ms/29 ms values were sized
+# for librosa's 23 ms hop and left a 46 ms model error uncorrectable at 90 BPM.
+# Ceilings keep the window under a sixteenth note at any plausible tempo.
+BEATGRID_REFINE_WINDOW_OF_BEAT = 0.15
+BEATGRID_REFINE_WINDOW_MAX = 0.100
+BEATGRID_REFINE_MOVE_OF_BEAT = 0.10
+BEATGRID_REFINE_MOVE_MIN = 0.029
+BEATGRID_REFINE_MOVE_MAX = 0.070
+# Peak-picking threshold for the onset list the grid editor snaps to, as a
+# multiple of this percentile of the onset envelope. Tuned against an
+# independent spectral-flux detector on two real tracks: this pair lands within
+# 1.01-1.13x of its onset count, while a lower bar detects 3-5x too many and
+# would let a dragged beat snap to noise. The percentile must stay high --
+# the envelope is mostly zeros, so the 65th percentile is literally 0.
+BEATGRID_ONSET_PERCENTILE = 90
+BEATGRID_ONSET_DELTA_MULT = 1.5
+# Hard cap on onsets shipped to the client, dropped weakest-first.
+BEATGRID_MAX_ONSETS = 6000
+# The same bound has to apply to *interpolated* beats, not just snapped ones,
+# and as a fraction of a beat rather than of the hop. Beats in a drum-free
+# section have no peak to snap to, so they are positioned by interpolation over
+# beat index -- and without a clamp that interpolation happily redistributes a
+# 5 s silent gap, which measured a 4001 ms displacement on one beat of Welcome
+# To Paradise (138x the 29 ms snap limit). Refinement sharpens where a beat
+# sits; it must never decide which pulse a beat belongs to.
+BEATGRID_REFINE_MAX_INTERP_FRAC = 0.25
+# An onset peak must clear this percentile of the whole envelope to count as a
+# real hit. Below it, the beat is treated as unplayed and its position is
+# interpolated from its neighbours instead of snapped to noise.
+BEATGRID_REFINE_PERCENTILE = 70
+# A beat counts as "confirmed" when a detected onset lands within this fraction
+# of the median beat interval. 0.15 of a 500 ms beat is 75 ms -- wide enough to
+# absorb human feel and hop quantisation, tight enough that a half-time or
+# double-time grid error fails the check.
+BEATGRID_ONSET_TOL_FRAC = 0.15
+BEATGRID_ONSET_TOL_MAX = 0.07  # absolute ceiling on the above, seconds
+# Max height for the MP4 video stream pulled from YouTube (issue #219).
+# Capped to keep downloads reasonable; 1080p of a full song is large.
+VIDEO_MAX_HEIGHT = max(144, _env_int("STEMDECK_VIDEO_MAX_HEIGHT", 720))
+
+
+# Output options for every WAV ffmpeg writes. Without them the muxer inserts a
+# LIST/INFO chunk (ISFT "Lavf...", plus any tags carried over from the input)
+# between fmt and data. That is valid RIFF, but hardware players and samplers
+# that only parse the canonical 44-byte header refuse the file. Both flags are
+# needed: -map_metadata -1 drops inherited tags, +bitexact drops the encoder tag.
+WAV_PLAIN_HEADER_ARGS = ("-map_metadata", "-1", "-fflags", "+bitexact")
+
+
+def ffmpeg_executable() -> str:
+    """Return the preferred FFmpeg executable.
+
+    In portable mode, setup places FFmpeg under DATA_DIR/ffmpeg. Prefer that
+    binary when present; otherwise fall back to PATH so local dev and Docker
+    keep working exactly as before.
+    """
+    return str(FFMPEG_BIN) if FFMPEG_BIN.is_file() else "ffmpeg"
+
+
+def ffprobe_executable() -> str:
+    """Return the preferred ffprobe executable (same bundled dir as ffmpeg)."""
+    return str(FFPROBE_BIN) if FFPROBE_BIN.is_file() else "ffprobe"
+
+
+def ffmpeg_dir() -> Path | None:
+    """The directory holding the FFmpeg this process actually runs, or None.
+
+    PATH and yt-dlp both need a directory, and they used to be given
+    FFMPEG_DIR: in a desktop install always data/ffmpeg, whatever setup had
+    concluded about what lives there. Setup can reject that copy and settle on
+    another -- an Intel pair on Apple Silicon (#637), a build missing an
+    encoder -- and tell the backend through STEMDECK_FFMPEG/STEMDECK_FFPROBE,
+    which ffmpeg_executable() honours. PATH and yt-dlp never got the message,
+    so separation used the verified binary while every YouTube import ran the
+    rejected one (#651).
+
+    So the directory is derived from the binary, which makes it one answer
+    everywhere. It also covers data/ffmpeg/bin/, the nested layout setup
+    accepts (#248): yt-dlp was handed data/ffmpeg there, which holds no binary
+    at all, and yt-dlp does not fall back to PATH from a directory it was
+    given.
+
+    None when there is no single directory to hand over: no binaries (Docker,
+    or a source checkout with FFmpeg on PATH, where PATH is already right), or
+    ffmpeg and ffprobe in different places. yt-dlp takes one directory and
+    looks for both in it, so a split pair is left to PATH, where the desktop
+    shell has already put the verified directory first.
+
+    A hand-set STEMDECK_FFMPEG_DIR is still honoured: FFMPEG_BIN defaults to a
+    file inside it.
+
+    Evaluated per call, not bound at import, so nothing has to agree with a
+    value captured before the environment was final.
+    """
+    if not (FFMPEG_BIN.is_file() and FFPROBE_BIN.is_file()):
+        return None
+    directory = FFMPEG_BIN.resolve().parent
+    if FFPROBE_BIN.resolve().parent != directory:
+        return None
+    return directory
+
+
+def configure_portable_environment() -> None:
+    """Keep generated caches inside the portable data folder when requested.
+
+    This is intentionally best-effort. It only sets variables that are still
+    unset, so explicit caller/env choices win.
+    """
+    # FFmpeg first on PATH for anything that runs a bare `ffmpeg`, Demucs
+    # decoding a compressed source among them. See ffmpeg_dir() for why this is
+    # the verified binary's directory and not FFMPEG_DIR.
+    directory = ffmpeg_dir()
+    if directory is not None:
+        path = os.environ.get("PATH", "")
+        ffmpeg_path = str(directory)
+        if ffmpeg_path not in path.split(os.pathsep):
+            os.environ["PATH"] = ffmpeg_path + (os.pathsep + path if path else "")
+        logger.info("FFmpeg directory: %s", directory)
+    else:
+        logger.info("FFmpeg directory: none of our own, resolving from PATH")
+    # Said out loud because the failure it prevents was silent: a data-directory
+    # FFmpeg that is not the one in use is the copy setup rejected, and the
+    # error a user sees if it is ever run names that binary (#651). Not said
+    # for data/ffmpeg/bin/, which is the same install in its nested layout.
+    if FFMPEG_DIR.is_dir() and (
+        directory is None or not directory.is_relative_to(FFMPEG_DIR.resolve())
+    ):
+        logger.info(
+            "Not using %s: the FFmpeg in use is %s",
+            FFMPEG_DIR,
+            directory or "whatever PATH resolves",
+        )
+
+    if PORTABLE_DATA_DIR_ENABLED:
+        os.environ.setdefault("XDG_CACHE_HOME", str(CACHE_DIR))
+        os.environ.setdefault("TORCH_HOME", str(MODELS_DIR / "torch"))
+
+
+def ensure_runtime_dirs() -> None:
+    paths = (
+        (JOBS_DIR, CACHE_DIR, DOWNLOADS_DIR, MODELS_DIR, LOGS_DIR)
+        if PORTABLE_DATA_DIR_ENABLED
+        else (JOBS_DIR,)
+    )
+    for path in paths:
+        path.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,164 @@
+# Build from source
+
+<sub>[Back to the README](../README.md)</sub>
+
+Every way to run StemDeck from this repository: the macOS app, a web server on any platform, Docker and Unraid.
+
+### macOS Native App
+
+Requires Rust, Node.js, and Python 3.11, 3.12 or 3.13. Builds a self-contained `.app` that downloads its own runtime on first launch.
+
+```sh
+# First time only: add the cross-compilation targets
+rustup target add aarch64-apple-darwin   # Apple Silicon
+rustup target add x86_64-apple-darwin    # Intel
+
+# Build Apple Silicon
+ARCH=arm64 scripts/macos/make-runtime-pack.sh
+ARCH=arm64 scripts/macos/make-app.sh
+ARCH=arm64 scripts/macos/make-dmg.sh
+
+# Build Intel (requires Rosetta 2 and an x86_64 Python)
+ARCH=x64 scripts/macos/make-runtime-pack.sh
+ARCH=x64 scripts/macos/make-app.sh
+ARCH=x64 scripts/macos/make-dmg.sh
+```
+
+The `.app` lands at `desktop/src-tauri/target/<target>/release/bundle/macos/StemDeck.app`. The DMG lands at `.build/macos-dist/StemDeck-macOS-<arch>.dmg`.
+
+To run a fresh build directly without the DMG:
+
+```sh
+open desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/StemDeck.app
+```
+
+If macOS blocks the app with a Gatekeeper prompt, run:
+
+```sh
+xattr -dr com.apple.quarantine desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/StemDeck.app
+```
+
+> **Note:** To test a clean first-launch during development, you can wipe previous app data first: `rm -rf ~/Library/Application\ Support/StemDeck`. Don't do this on a real install.
+
+---
+
+### Web Server (macOS / Linux / Windows with Python 3.11 to 3.13)
+
+#### Prerequisites
+
+Python 3.11, 3.12 or 3.13 (3.14 is not supported yet), FFmpeg 5.1 or newer on your PATH, and [uv](https://github.com/astral-sh/uv). Ubuntu 22.04's `ffmpeg` package is 4.4, which StemDeck reports as too old at startup, and exports do not work with it: install a newer FFmpeg there, or set `STEMDECK_FFMPEG` to one. Around 170 MB of free disk for the Demucs model, which downloads automatically on first run.
+
+Optional, for song identification with an AcoustID key: an FFmpeg built with chromaprint (Debian and Ubuntu's `ffmpeg` is), or Chromaprint's `fpcalc` on your PATH (`brew install chromaprint`, `apt install libchromaprint-tools`, or your distro's `chromaprint` package). `./run.sh setup` installs it when your FFmpeg needs it. Without either, songs are identified by their tags only.
+
+#### macOS / Linux (one-shot)
+
+```sh
+git clone https://github.com/stemdeckapp/stemdeck stemdeck && cd stemdeck
+./run.sh setup     # installs ffmpeg + uv, runs uv sync
+./run.sh start
+```
+
+Open <http://localhost:8000>.
+
+`setup` uses Homebrew on macOS and `apt-get` on Debian/Ubuntu. For other Linux distros, install `ffmpeg` and [uv](https://github.com/astral-sh/uv) manually, then run `uv sync` followed by `./run.sh start`.
+
+#### Windows (PowerShell)
+
+Install prerequisites:
+- [uv](https://docs.astral.sh/uv/getting-started/installation/): `winget install astral-sh.uv`
+- [ffmpeg](https://ffmpeg.org/download.html): `winget install Gyan.FFmpeg` (or Chocolatey: `choco install ffmpeg`)
+
+```powershell
+git clone https://github.com/stemdeckapp/stemdeck stemdeck; cd stemdeck
+uv sync
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --timeout-graceful-shutdown 5
+```
+
+Open <http://localhost:8000>.
+
+> `run.sh` is macOS/Linux only. On Windows use the PowerShell commands above, or run inside WSL.
+
+**NVIDIA GPU (CUDA):** install the CUDA-enabled torch build before starting:
+
+```powershell
+uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+$env:STEMDECK_DEMUCS_DEVICE = "cuda"
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --timeout-graceful-shutdown 5
+```
+
+**AMD GPU (ROCm, Linux only, community-tested):** swap in the ROCm build of torch after `uv sync`. It drives an AMD GPU through the same `cuda` device, so nothing else changes, and it carries its own ROCm runtime: the host needs only the `amdgpu` kernel driver and read/write access to `/dev/kfd` (usually the `render` group). torch 2.8.0 on `rocm6.4` has kernels for RDNA4 (RX 9000), RDNA3 (RX 7000), gfx1030 (RX 6800/6900) and Instinct cards; `torch.cuda.get_arch_list()` prints the full list.
+
+```sh
+uv pip install --no-deps --reinstall torch==2.8.0+rocm6.4 torchaudio==2.8.0+rocm6.4 torchvision==0.23.0+rocm6.4 \
+  --index-url https://download.pytorch.org/whl/rocm6.4
+uv run --no-sync python -c "import torch; print(torch.version.hip, torch.cuda.get_device_name(0))"
+uv run --no-sync uvicorn app.main:app --host 127.0.0.1 --port 8000 --timeout-graceful-shutdown 5
+```
+
+`--no-sync` matters: a plain `uv run` puts the locked torch back. With a second AMD GPU (a Ryzen's integrated one, for example), set `ROCR_VISIBLE_DEVICES` to the card's index so HIP sees only it; the desktop app does this for you.
+
+---
+
+#### Manual (any platform)
+
+```sh
+git clone https://github.com/stemdeckapp/stemdeck stemdeck && cd stemdeck
+uv sync
+uv run uvicorn app.main:app --reload --timeout-graceful-shutdown 5
+```
+
+> `--timeout-graceful-shutdown` bounds how long uvicorn waits for open
+> connections when you stop it. StemDeck keeps a long-lived SSE stream open
+> for the import queue while a browser tab is on the app, so without it
+> Ctrl-C waits for that stream instead of exiting.
+
+#### Docker
+
+```sh
+docker compose -f build/docker-compose.yml up --build
+```
+
+Stems land in `./jobs/` on the host. Demucs weights are cached in a named volume so they don't re-download on rebuild. Note: no GPU passthrough on macOS Docker.
+
+A prebuilt image is published to GHCR. Tags: `edge` (rolling, rebuilt on every merge to main), `latest` (newest stable release), and `X.Y.Z` (pinned to a release).
+
+```sh
+docker run -d --name stemdeck -p 8000:8000 \
+  -v /path/to/jobs:/app/jobs \
+  -v /path/to/cache:/cache \
+  -e STEMDECK_PERSIST_LIBRARY=1 \
+  ghcr.io/stemdeckapp/stemdeck:edge
+```
+
+On a Linux host with an NVIDIA GPU (driver + NVIDIA Container Toolkit installed), add `--runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all` and StemDeck auto-detects CUDA. The image already bundles CUDA-enabled torch, so no separate CUDA install is needed.
+
+On a Linux host with an AMD GPU (community-tested), use a `-rocm` tag (`edge-rocm`, `rocm` for the newest stable release, `X.Y.Z-rocm`) and pass the GPU's device nodes. The host needs only the `amdgpu` kernel driver; the ROCm runtime is in the image, and the entrypoint keeps the groups the device nodes belong to, so no `--group-add` is needed:
+
+```sh
+docker run -d --name stemdeck -p 8000:8000 \
+  --device /dev/kfd --device /dev/dri \
+  -v /path/to/jobs:/app/jobs \
+  -v /path/to/cache:/cache \
+  ghcr.io/stemdeckapp/stemdeck:rocm
+```
+
+To build it yourself: `docker build -f build/Dockerfile --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/rocm6.4 .` (or uncomment the ROCm lines in `build/docker-compose.yml`).
+
+#### Unraid
+
+StemDeck is available in Unraid Community Applications: open **Apps**, search "StemDeck", and install. Map the two volumes to persistent appdata paths:
+
+- `/app/jobs` -> `/mnt/user/appdata/stemdeck/jobs` (library + stems)
+- `/cache` -> `/mnt/user/appdata/stemdeck/cache` (model weights)
+
+The library is persistent by default (`STEMDECK_PERSIST_LIBRARY=1`), so tracks are never auto-deleted. For GPU acceleration, install the **Nvidia Driver** plugin, then set the container's Extra Parameters to `--runtime=nvidia` (the `NVIDIA_VISIBLE_DEVICES` and `NVIDIA_DRIVER_CAPABILITIES` variables are already in the template). For an AMD GPU, set the repository to `ghcr.io/stemdeckapp/stemdeck:rocm` and the Extra Parameters to `--device /dev/kfd --device /dev/dri` instead; the host needs the `amdgpu` driver loaded (`/dev/kfd` must exist). CPU-only works with no extra configuration.
+
+#### `run.sh` control script
+
+```sh
+./run.sh setup      # one-shot: install ffmpeg + uv, then uv sync
+./run.sh start      # boots uvicorn in the background
+./run.sh stop       # graceful shutdown
+./run.sh restart    # stop + start
+./run.sh status     # is it running?
+```

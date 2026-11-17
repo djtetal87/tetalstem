@@ -1,0 +1,333 @@
+# TetalStem
+
+Separador de stems para Mac (chip M1/M2/M3/M4 **y** Intel), por **DJ Tetal**.
+
+Tres modos en un solo lugar (selector junto al botón de extraer):
+
+| Modo | Motor | Para qué |
+|---|---|---|
+| ⚡ Rápido | Demucs htdemucs_6s, una pasada | Sacar stems al toque |
+| 🎚 Alta calidad | Demucs ×2 promediado | Stems más limpios (2× más lento) |
+| 💎 Ultra | BS-Roformer (motor de UVR) aísla la voz + Demucs separa el resto | Acapellas e instrumentales lo más limpios posible. Solo en Mac con chip M; en Intel usa Alta calidad |
+
+**Descarga:** pestaña *Releases* → `TetalStem-macOS-arm64.dmg` (M1) o `TetalStem-macOS-x64.dmg` (Intel).
+La primera vez la app descarga su motor (~1-2 GB). Como no está firmada por Apple: clic derecho → Abrir.
+
+Basado en [StemDeck](https://github.com/thcp/stemdeck) de Thales Claro, software libre bajo GNU AGPL-3.0; TetalStem mantiene la misma licencia.
+
+---
+
+<div align="center">
+
+<img src="imgs/stemdeck-svg-assets/stemdeck-logo-stacked.svg" alt="TetalStem" width="515" />
+
+
+<div align="center">
+  <a href="https://github.com/djtetal87/tetalstem/actions/workflows/ci.yml"><img src="https://github.com/djtetal87/tetalstem/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/djtetal87/tetalstem/stargazers"><img src="https://img.shields.io/github/stars/djtetal87/tetalstem?style=flat-square" alt="GitHub Stars"></a>
+  <a href="https://github.com/djtetal87/tetalstem/releases"><img src="https://img.shields.io/github/downloads/djtetal87/tetalstem/total?style=flat-square&color=52c65f" alt="Total Downloads"></a>
+  <a href="https://github.com/djtetal87/tetalstem/releases/latest"><img src="https://img.shields.io/github/v/release/djtetal87/tetalstem?style=flat-square" alt="Latest Release"></a>
+  <a href="https://github.com/djtetal87/tetalstem/blob/main/LICENSE"><img src="https://img.shields.io/github/license/djtetal87/tetalstem?style=flat-square" alt="License"></a>
+</div>
+
+<br>
+
+<p align="center"><sub>JOIN THE COMMUNITY</sub></p>
+<div align="center">
+  <a href="https://github.com/djtetal87/tetalstem"><img src="https://img.shields.io/badge/GitHub-stemdeckapp-181717?style=flat-square&logo=github&logoColor=white" alt="GitHub"></a>
+  <a href="https://discord.gg/YhCKsjhcwB"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Discord"></a>
+  <a href="https://www.reddit.com/r/TetalStemApp/"><img src="https://img.shields.io/badge/Reddit-r%2FTetalStemApp-FF4500?style=flat-square&logo=reddit&logoColor=white" alt="Reddit"></a>
+  <a href="https://www.instagram.com/stemdeck"><img src="https://img.shields.io/badge/Instagram-stemdeck-E4405F?style=flat-square&logo=instagram&logoColor=white" alt="Instagram"></a>
+  <a href="https://x.com/TetalStemApp"><img src="https://img.shields.io/badge/X-TetalStemApp-000000?style=flat-square&logo=x&logoColor=white" alt="X"></a>
+  <a href="https://stemdeck.app"><img src="https://img.shields.io/badge/Website-stemdeck.app-000000?style=flat-square&logo=safari&logoColor=white" alt="Website"></a>
+</div>
+
+</div>
+
+<br>
+
+<p align="center">
+  <b>Drop in a song. Get every instrument on its own track. Practice with them.</b><br>
+  <sub>Runs on your own computer: no account, no subscription, and your audio is not uploaded.</sub>
+</p>
+
+<p align="center">
+  <a href="#download"><img src="https://img.shields.io/badge/Download-free-f4b740?style=for-the-badge" alt="Download, free"></a>
+  <a href="https://github.com/djtetal87/tetalstem/releases/latest"><img src="https://img.shields.io/github/v/release/djtetal87/tetalstem?style=for-the-badge&label=latest&color=2e3942" alt="Latest release"></a>
+</p>
+
+<p align="center">
+  <a href="#download"><b>Download</b></a> &nbsp;·&nbsp;
+  <a href="#what-you-can-do">What you can do</a> &nbsp;·&nbsp;
+  <a href="#honest-comparison">Honest comparison</a> &nbsp;·&nbsp;
+  <a href="#we-recommend">We Recommend</a> &nbsp;·&nbsp;
+  <a href="#for-developers">For developers</a>
+</p>
+
+<p align="center">
+  <img src="imgs/screenshot/stemdeck.png" alt="The TetalStem studio: a song split into vocals, drums, bass, guitar, piano and other, each on its own lane" width="100%">
+</p>
+
+TetalStem splits a song into up to six stems, vocals, drums, bass, guitar, piano and other, and opens them in a studio where you can mute, solo, slow down, loop, change the key and play along with a click. Sing along in Karaoke, or film yourself playing along in Performance. Drop in an audio file or paste a YouTube or SoundCloud link. Separation runs on your own machine, and TetalStem does not upload your audio.
+
+> **A separation tool, not a downloader.** TetalStem is for processing audio you have the right to use. What you import, the stems made from it, and the takes you record, are saved in your library folder on the machine that runs TetalStem; TetalStem does not upload or share them. See the [Disclaimer](#disclaimer).
+
+
+<a name="download"></a>
+
+## <img src="imgs/readme/download.svg" width="26" align="top" alt=""> Download
+
+Each link downloads the latest release. [Release notes](https://github.com/djtetal87/tetalstem/releases/latest) · [Every version](https://github.com/djtetal87/tetalstem/releases)
+
+| Platform | NVIDIA, AMD (Linux) or Apple Silicon | Everything else |
+|---|---|---|
+| <img src="imgs/readme/os-windows.svg" width="16" align="top" alt=""> &nbsp;**Windows** | [NVIDIA GPU](https://github.com/djtetal87/tetalstem/releases/latest/download/TetalStem-Windows-x64.NVIDIA.zip) | [No NVIDIA GPU](https://github.com/djtetal87/tetalstem/releases/latest/download/TetalStem-Windows-x64.zip) |
+| <img src="imgs/readme/os-apple.svg" width="16" align="top" alt=""> &nbsp;**macOS** | [Apple Silicon (M1 and later)](https://github.com/djtetal87/tetalstem/releases/latest/download/TetalStem-macOS-arm64.dmg) | [Intel Mac](https://github.com/djtetal87/tetalstem/releases/latest/download/TetalStem-macOS-x64.dmg) |
+| <img src="imgs/readme/os-linux.svg" width="16" align="top" alt=""> &nbsp;**Linux** | [NVIDIA or AMD GPU](https://github.com/djtetal87/tetalstem/releases/latest/download/TetalStem-Linux-x64.NVIDIA.tar.gz) | [No NVIDIA or AMD GPU](https://github.com/djtetal87/tetalstem/releases/latest/download/TetalStem-Linux-x64.tar.gz) |
+
+<img src="imgs/readme/os-docker.svg" width="16" align="top" alt=""> &nbsp;**Docker / Unraid:** [`ghcr.io/djtetal87/tetalstem:latest`](https://github.com/djtetal87/tetalstem/pkgs/container/stemdeck). It runs on the CPU as it is; add `--runtime=nvidia` to use an NVIDIA GPU. For an AMD GPU (community-tested), use the `:rocm` tag with `--device /dev/kfd --device /dev/dri`. On Unraid, search "TetalStem" in Apps.
+
+<details>
+<summary><b>What's new in 0.21.0</b></summary>
+
+<br>
+
+- **Four modes:** Practice, Advanced, Karaoke and Performance, all in one Mode menu.
+- **Karaoke.** The lyrics fill the window and light up as the song plays, with the voice off and a queue of songs.
+- **Performance.** Film yourself playing along, review the take, trim it and export an MP4.
+- **Each mode keeps its own stems and its own saved mix** of a song.
+- **Advanced** gains an EQ on every lane, a Master with a loudness target, recording tracks and video tracks.
+- **A redesigned Settings,** with a section list and a search box.
+- **A GPU video encoder** for Performance exports, with an automatic fall-back to the CPU.
+- **Safer by default:** a guard against requests from other websites, auto-delete that skips favorites, songs with takes or versions, and songs still being worked on, and a library that survives one bad record.
+- **Imports:** a Detect lyrics switch, and Try again on an import that failed.
+
+All of it, with credits to the people who reported each problem, is in the [release notes](https://github.com/djtetal87/tetalstem/releases/latest).
+
+</details>
+
+<details>
+<summary><b>Installing, per platform</b></summary>
+
+<br>
+
+**Windows and Linux.** Unzip, then run `TetalStem.exe` (Windows) or `TetalStem` (Linux). No installer and nothing else to install. Put the folder somewhere you can write to, such as `C:\TetalStem`: a portable TetalStem keeps its runtime, models and settings, and on Windows your songs by default, in a `data` folder beside it, so it cannot run from Program Files. The first launch downloads FFmpeg and the separation model, and on an NVIDIA card (or, on Linux, an AMD card ROCm supports, such as the RX 7000 and RX 9000 series) sets up GPU support; later launches start in seconds.
+
+**macOS.** Open the DMG and drag TetalStem to Applications. TetalStem is not code-signed yet, so clear the quarantine flag once, or macOS will say the app is damaged:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/TetalStem.app
+```
+
+The first launch downloads the runtime and the model. Apple Silicon separates on its built-in GPU.
+
+**Docker and Unraid.** See [Build from source](docs/build-from-source.md#docker) for the `docker run` line, GPU passthrough and the Unraid volume mapping.
+
+**Updates.** The desktop app tells you when a new version is out. On Windows and Linux it usually installs the update for you. A version that changes the Python packages TetalStem runs on is a full download instead, and 0.21.0 is one: about 300 MB on Windows and 420 MB on Linux, once. On Windows, unzip it over your current TetalStem folder. The zip has no files inside `data`, so your songs, models and settings there stay as they are. A portable TetalStem no longer opens a library in `Documents\TetalStem\jobs` on its own: if yours is there, choose that folder once in Settings, StemData location. Unzipped into a new folder, TetalStem starts with default settings, without the songs from the old `data` folder, and downloads FFmpeg and the model again. On macOS, download the new DMG.
+
+</details>
+
+<a name="what-you-can-do"></a>
+
+## <img src="imgs/readme/grid.svg" width="26" align="top" alt=""> What you can do
+
+<a name="modes"></a>
+
+### <img src="imgs/readme/grid.svg" width="22" align="top" alt=""> Modes
+
+Pick one from **Mode** in the left rail. Each mode keeps its own choice of stems and its own saved mix of a song, so a change in one does not follow you into another.
+
+- **Practice:** stems, mixer, speed, key, click and loop, without recording, EQ or the master.
+- **Advanced:** everything, with recording tracks, take folders, an EQ on every lane, the master and video.
+- **Karaoke:** the lyrics fill the window and light up word by word as the song plays. Switch the voice and the backing vocals on or off, and drag songs from the library into a queue.
+- **Performance:** film yourself playing along to the song, then export the video.
+
+### <img src="imgs/readme/stems.svg" width="22" align="top" alt=""> Split any song
+
+- **Up to six stems** with Meta's open Demucs model: vocals, drums, bass, guitar, piano and other.
+- **Lead and backing vocals** as separate lanes, on demand (not on Intel Macs).
+- **Files or links:** MP3, WAV, FLAC, OGG, Opus, M4A and MP4, or a YouTube or SoundCloud link.
+- **Search without leaving the app:** YouTube songs and playlists, and SoundCloud, with a preview.
+- **Pick only what you need** before you extract.
+- **Choose the lanes in each mode** with **Stems**: the stems you pick get their own lane, the rest play together in Original. Nothing is separated again.
+- **Whole YouTube playlists** go into an import queue and run one after another.
+
+### <img src="imgs/readme/sliders.svg" width="22" align="top" alt=""> Practice with it
+
+- **Mute or solo** any part, and set each one's volume.
+- **Slow it down** to half speed, or anywhere from 0.50x to 0.99x, without changing the pitch.
+- **Loop the hard part**, by dragging across the waveform.
+- **Change the key**, of the whole song or of one part.
+- **Play with a click** that follows the song, with a count-in, any beats per bar and groupings such as 3+2+2.
+- **Fix the beat grid** when the click drifts: move, add or remove beats and mark the bar lines.
+
+### <img src="imgs/readme/export.svg" width="22" align="top" alt=""> Film yourself playing
+
+In Performance mode:
+
+- **Your camera and your input:** pick a camera, or none, and your microphone or audio interface input.
+- **Say what you play** with **I play**, and that part is taken out of the backing track you hear and out of the video.
+- **Review the take** in step with the song, and trim its start and end on the **Take Timeline**.
+- **Export to MP4** at 720p or 1080p, at 24, 30 or 60 fps. TetalStem uses your graphics card when its encoder passes a short test on your computer, and the CPU otherwise. **Settings > Export** has a Video encoder choice and a Test encoders button.
+- **The video stays on your computer.** Uploading and live streaming are not part of this release.
+
+### <img src="imgs/readme/gauge.svg" width="22" align="top" alt=""> Know the song
+
+- **Key, tempo and loudness,** found for you.
+- **Sections** such as verse, chorus and solo, detected for you (experimental) or marked by hand.
+- **Synced lyrics** from LRCLIB, with timing you can fix by tapping along. With an NVIDIA GPU, or an AMD one on Linux, TetalStem can also write them down from the vocals when none are found.
+- **Song and artist details** from MusicBrainz, Wikipedia and, optionally, Discogs.
+
+### <img src="imgs/readme/export.svg" width="22" align="top" alt=""> Keep and share
+
+- **Export** what you hear as one file, every part as a `.zip`, only the looped part, or, when the song came with a video, a video with the original picture. Add the click or a count-in if you like.
+- **Drag a stem or a loop** from the desktop app straight into your other music software.
+- **A library** with colored folders, tags you can search by (`#tag`), favorites, and a Trash that only deletes when you empty it.
+
+### <img src="imgs/readme/eye.svg" width="22" align="top" alt=""> It explains itself
+
+Click **Guide** in the left rail and point at anything. Every button, lane control and number says what it does, in plain words, and so do the Mode menu and the options in Settings. While Guide is on, clicks explain instead of acting, so nothing happens by accident.
+
+**Settings** has a list of sections on the left and a search box, and most changes save as soon as you make them.
+
+### <img src="imgs/readme/phone.svg" width="22" align="top" alt=""> On your phone too
+
+Turn on **Make TetalStem available on your network** in Settings and scan the QR code. Your phone opens your library and mixer over your own Wi-Fi, with speed and key controls. No app store, no cloud.
+
+<p align="center">
+  <b>Windows, Linux and macOS</b> &nbsp;·&nbsp; <b>Docker and Unraid</b> &nbsp;·&nbsp; <b>11 languages</b><br>
+  <sub>English · Deutsch · Español · Français · Bahasa Indonesia · 日本語 · 한국어 · Polski · Português (Brasil) · Português (Portugal) · 简体中文</sub>
+</p>
+
+
+
+<a name="honest-comparison"></a>
+
+## <img src="imgs/readme/check.svg" width="26" align="top" alt=""> Honest comparison
+
+TetalStem is not trying to beat the commercial stem-separation services. It covers the core well and stops there. This table is here so you can choose knowingly rather than find the gaps later.
+
+| | TetalStem | Moises, LALAL.AI and similar |
+|---|---|---|
+| **Price** | Free and open source | Usually freemium, with credits or a subscription for regular use |
+| **Where it runs** | On your own machine | Usually in the cloud, so your audio is uploaded |
+| **Account** | None | Usually required |
+| **Internet** | For links, the first model download, update checks, and song details and lyrics | Usually needed to process audio |
+| **Privacy** | Your audio is not uploaded; song names are looked up for details and lyrics | Processed on their servers, under their own retention policy |
+| **Separation model** | Demucs `htdemucs_6s`, open source from Meta | Their own models, which may give better results |
+| **Stems** | 6, plus lead and backing vocals | Varies; some offer more instruments |
+| **Speed** | Depends on your hardware: fast on a GPU, slow on a CPU | Fast on any hardware |
+| **Many songs at once** | An import queue and whole playlists, run one after another | Varies by service and plan |
+| **Phone** | Your phone opens TetalStem over your own Wi-Fi; no app store app | Some offer mobile apps |
+| **Practice tools** | Speed, key change, loops, click track with count-in, synced lyrics; no chord detection | Varies by product; often chords and more |
+| **Polish** | A one-person open-source project | Polished, production-grade apps |
+| **Source code** | Open source, forkable, self-hostable | Closed |
+
+If you need the best quality, speed on any machine, or a store-bought phone app, the commercial products are worth the money. If you want stems for practice and study, keep your audio private, and like software with no strings attached, TetalStem is enough.
+
+
+<a name="we-recommend"></a>
+
+## <img src="imgs/readme/person.svg" width="26" align="top" alt=""> We Recommend
+
+TetalStem is free and **does not accept any money, sponsorship, or funding**  from anyone listed below. I share these makers and artists and communities purely for the joy of pointing you toward wonderful people doing beautiful work. Go meet them ❤️
+
+| Category | Name | What they do | Link |
+|---|---|---|---|
+| Artists & Creators | Adrianna Claro | Soul and Contemporary R&B Singer, Songwriter and Composer | [Spotify](https://open.spotify.com/album/10fZ48iJhIe3lWcXSMUlFG) · [Apple Music](https://music.apple.com/us/album/happy/1592026727?i=1592026728) |
+| Artists & Creators | Analog4Lyfe | Analog gear specialist | [@analog4lyfe](https://www.instagram.com/analog4lyfe) |
+| Artists & Creators | Dead röses | Cork-based punk rock band | [@dead_rosesband](https://www.instagram.com/dead_rosesband) |
+| Artists & Creators | Joao Gaspar | Producer, film scorer, touring/session musician | [@jay_glaspar](https://www.instagram.com/jay_glaspar) |
+| Artists & Creators | Killah Trakz | Industry Secret Villain and Media Influencer | [@killahtrakz](https://www.instagram.com/killahtrakz/) · [Spotify](https://open.spotify.com/artist/6nePYOqT4E7D4C48twPtKk) · [Apple Music](https://music.apple.com/us/artist/killah-trakz/371296633) |
+| Artists & Creators | More Notes Less Talk | Gear-focused creative project with a raw, tape-recorded identity | [@morenoteslesstalk](https://www.youtube.com/@morenoteslesstalk) |
+| Artists & Creators | NIHIL | Modern alternative metal from Argentina. Fueled by emotionally charged vocals, anger and emptiness | [@somosnihil](https://www.instagram.com/somosnihil/) · [Spotify](https://open.spotify.com/artist/1OeKplJxFNM6JHrWeo2SaV) |
+| Instrument Builders & Repair | Dlima Guitars | Custom guitars and basses | [@dlimaguitars](https://www.instagram.com/dlimaguitars) |
+| Instrument Builders & Repair | Kris Luthier | Instrument repair and restoration | [@krisluthier](https://www.instagram.com/krisluthier) |
+| Instrument Builders & Repair | Lisbon Guitar Works | Handmade guitars in Lisbon | [dlimaguitars.com](https://dlimaguitars.com) |
+| Media & Community | Not Another Audio Podcast | Audio, music and tech industry podcast by working professionals | [Libsyn](https://directory.libsyn.com/shows/view/id/20f5a1e3-6fea-4d41-8cdf-451ce6fc6cda) |
+| Media & Community | r/bass | Bass-player community | [r/Bass](https://www.reddit.com/r/Bass) |
+| Media & Community | slashCAM | Camera, video, and post-production media | [@slashcam.de](https://www.instagram.com/slashcam.de) |
+| Music & Karaoke Technology | Beltr | Local, subscription-free karaoke software | [beltr.app](https://beltr.app/) |
+| Music & Karaoke Technology | Seratone | TV-based karaoke system | [seratone.audio](https://seratone.audio/) |
+| Music Gear | Empress Effects | Boutique effects pedals | [empresseffects.com](https://empresseffects.com) |
+| Music Gear | Thomann | Large music-equipment retailer | [@thomann.music](https://www.instagram.com/thomann.music) |
+| Writers & Storytellers | Alexandre Borges | Portuguese writer, screenwriter, and cultural commentator | [Books & author profile](https://www.instagram.com/alexgram_b/) |
+
+
+## <img src="imgs/readme/zap.svg" width="26" align="top" alt=""> Star history
+
+<a href="https://www.star-history.com/?repos=stemdeckapp%2Fstemdeck&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=djtetal87/tetalstem&type=date&theme=dark&legend=top-left&sealed_token=ZCLzbiDb9k7qGcBlGZ4Y7ztZz0mepkiAVraLOc4qeVQjSM_MfPIQD7P9n2wvwBM8mw8EKfkSAQfM2vByzi3mEPklzgSWtYnVzZsfexzb7LxwoATlrgSmWesQiwczpg4xa32nF4_Np1Qpe62s5eFsl0o46JzPuwwd5M6pwShbj1PfDMFD4b0Yuu0jH3rD" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=djtetal87/tetalstem&type=date&legend=top-left&sealed_token=ZCLzbiDb9k7qGcBlGZ4Y7ztZz0mepkiAVraLOc4qeVQjSM_MfPIQD7P9n2wvwBM8mw8EKfkSAQfM2vByzi3mEPklzgSWtYnVzZsfexzb7LxwoATlrgSmWesQiwczpg4xa32nF4_Np1Qpe62s5eFsl0o46JzPuwwd5M6pwShbj1PfDMFD4b0Yuu0jH3rD" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=djtetal87/tetalstem&type=date&legend=top-left&sealed_token=ZCLzbiDb9k7qGcBlGZ4Y7ztZz0mepkiAVraLOc4qeVQjSM_MfPIQD7P9n2wvwBM8mw8EKfkSAQfM2vByzi3mEPklzgSWtYnVzZsfexzb7LxwoATlrgSmWesQiwczpg4xa32nF4_Np1Qpe62s5eFsl0o46JzPuwwd5M6pwShbj1PfDMFD4b0Yuu0jH3rD" />
+ </picture>
+</a>
+
+
+<a name="for-developers"></a>
+
+## <img src="imgs/readme/wrench.svg" width="26" align="top" alt=""> For developers
+
+| Page | What it covers |
+|---|---|
+| **[Build from source](docs/build-from-source.md)** | The macOS app, a web server on any platform, Docker and Unraid |
+| **[Configuration](docs/configuration.md)** | Environment variables, and serving other devices over https |
+| **[HTTP API](docs/api.md)** | The endpoints the web app uses |
+| **[Troubleshooting](docs/troubleshooting.md)** | Common problems, and what lives where on disk |
+| **[Model licenses](docs/models.md)** | Where each machine-learning model's license comes from |
+
+<details>
+<summary><b>Built with</b></summary>
+
+<br>
+
+TetalStem is built on **[Python 3.12](https://python.org)** managed via **[uv](https://github.com/astral-sh/uv)**, with a **[FastAPI](https://fastapi.tiangolo.com)** backend serving REST and Server-Sent Events. Stem separation uses **[Demucs](https://github.com/facebookresearch/demucs)** (`htdemucs_6s`), Meta AI's open-source 6-stem neural network. The optional on-demand lead/backing vocal split runs the UVR-MDX-NET Karaoke 2 model via **[audio-separator](https://github.com/nomadkaraoke/python-audio-separator)**, trained as part of the **[Ultimate Vocal Remover](https://github.com/Anjok07/ultimatevocalremovergui)** project by Anjok07. YouTube audio is fetched via **[yt-dlp](https://github.com/yt-dlp/yt-dlp)**; transcoding and mixing use **[FFmpeg](https://ffmpeg.org)**. BPM detection and key analysis run on **[librosa](https://librosa.org)**; loudness measurement uses **[pyloudnorm](https://github.com/csteinmetz1/pyloudnorm)** (ITU-R BS.1770). The macOS and Windows desktop shells are **[Tauri v2](https://tauri.app)** (Rust/WKWebView on macOS, Rust/WebView2 on Windows). The frontend is vanilla JS with the Web Audio API, no framework and no build step; waveforms are rendered on `<canvas>` using min/max sample rendering.
+
+*Thanks to the creators and maintainers of all the open-source libraries that make TetalStem possible.*
+
+</details>
+
+
+<a name="disclaimer"></a>
+
+## <img src="imgs/readme/flag.svg" width="26" align="top" alt=""> Disclaimer
+
+TetalStem is a local audio stem separation tool intended for personal study, research, and experimentation. It is not a downloading service. Audio you import, the stems made from it, and the takes you record, are saved only in the library folder on the machine that runs TetalStem, and TetalStem does not upload, share or redistribute them. To find song details and lyrics it sends the song's name to the services named in its Settings and, only if you add an AcoustID key, an audio fingerprint; it does not send the audio itself.
+
+YouTube and SoundCloud link support is provided via [yt-dlp](https://github.com/yt-dlp/yt-dlp) as a convenience. Automated downloading may violate YouTube's Terms of Service. You, the user, are solely responsible for ensuring you have the right to process any audio you submit, complying with the terms of service of any site you download from, and respecting the copyright of the material you work with.
+
+You are also responsible for following the licenses of the underlying tools this project depends on (yt-dlp, Demucs, FFmpeg, PyTorch, and others listed in `pyproject.toml`).
+
+The author(s) of TetalStem provide this software "as is", without warranty of any kind, and accept no responsibility or liability for how it is used.
+
+
+## <img src="imgs/readme/shield.svg" width="26" align="top" alt=""> License
+
+TetalStem is free software under the [GNU Affero General Public License v3.0 only](LICENSE) (AGPL-3.0-only). You may use, study, change and share it. If you change it and let other people use your version over a network, the AGPL asks you to offer them its source code too; the About dialog links to the source for that reason.
+
+Releases up to and including 0.20.0 were published under Apache-2.0, and copies received under those terms keep them.
+
+Every download ships TetalStem's own `LICENSE.txt`, a `THIRD_PARTY_NOTICES.txt` and a `licenses/` folder. `licenses/INDEX.txt` lists each packaged Python dependency with its version and license, and each one's full license text sits beside it. That inventory is generated from the packaged interpreter at build time, so it describes what actually shipped rather than what was expected to.
+
+FFmpeg is a GPL build. TetalStem downloads it and runs it as a separate executable, so it does not change TetalStem's own license, and `THIRD_PARTY_NOTICES.txt` carries the written offer of source for the exact build your platform receives.
+
+
+## <img src="imgs/readme/globe.svg" width="26" align="top" alt=""> Community
+
+Questions, ideas and show-and-tell are all welcome.
+
+<div align="center">
+  <a href="https://github.com/djtetal87/tetalstem"><img src="https://img.shields.io/badge/GitHub-stemdeckapp-181717?style=flat-square&logo=github&logoColor=white" alt="GitHub"></a>
+  <a href="https://discord.gg/YhCKsjhcwB"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Discord"></a>
+  <a href="https://www.reddit.com/r/TetalStemApp/"><img src="https://img.shields.io/badge/Reddit-r%2FTetalStemApp-FF4500?style=flat-square&logo=reddit&logoColor=white" alt="Reddit"></a>
+  <a href="https://www.instagram.com/stemdeck"><img src="https://img.shields.io/badge/Instagram-stemdeck-E4405F?style=flat-square&logo=instagram&logoColor=white" alt="Instagram"></a>
+  <a href="https://x.com/TetalStemApp"><img src="https://img.shields.io/badge/X-TetalStemApp-000000?style=flat-square&logo=x&logoColor=white" alt="X"></a>
+  <a href="https://stemdeck.app"><img src="https://img.shields.io/badge/Website-stemdeck.app-000000?style=flat-square&logo=safari&logoColor=white" alt="Website"></a>
+</div>
+
+## <img src="imgs/readme/link.svg" width="26" align="top" alt=""> Contributing
+
+Issues, feature suggestions and pull requests are welcome. See the [open issues](https://github.com/djtetal87/tetalstem/issues) for what is planned, and [Build from source](docs/build-from-source.md) to run it yourself.
+
+If you would like to support the time I put into TetalStem, a Donate button shows in the app's left rail as soon as donating is set up. Donating is optional: TetalStem stays free, with every feature, for everyone.

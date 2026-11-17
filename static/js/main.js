@@ -1,0 +1,1424 @@
+// The studio mode first: it sets the class the DAW controls are hidden by.
+import "./mode.js";
+import {
+  loopBtn, loopEnabled, loopStart, loopEnd,
+  setLoopStart, setLoopEnd, selectedStems, saveSelectedStems, stemSelectionReady,
+  currentJobId, vocalSplitModeReady, setVocalSplitMode,
+  setAutoSectionsResetFn, onLoopChange, setTransposeExportAvailable,
+} from "./state.js";
+import { STEM_NAMES, syncStemNamesFromAPI } from "./constants.js";
+import { refreshStemChoiceVisuals } from "./stemChoice.js";
+import { renderEmptyShell, buildStripStems, downloadCurrentMix, downloadCurrentVideo, downloadAllStemsZip, openStemsInReaper, downloadRegionMix, regionDragPayload, stemRegionDragPayload, prewarmRegionMix, mixTransposeBlocked } from "./player.js";
+import { transposeExportFromHealth } from "./transposeExport.js";
+import { wireJobForm, showError } from "./job.js";
+import { initSearch } from "./search.js";
+import { wireTransportButtons } from "./transport.js";
+import { wireBeatGridUi } from "./beatgridUi.js";
+import { togglePlayPause, updateLoopRegionVisual, toggleMetronome, transport, setPlayheadTime, setLoopRange, clearLoop, isCountInRunning } from "./transport.js";
+import { setSectionsLoopBridge, refreshSectionsAddState } from "./sections.js";
+import { setTimelineTagsBridge, seekToTagForKey, shortcutIndex, refreshTagLoopState } from "./timelineTags.js";
+import { wireStemListControls, laneDragIcon } from "./mixer.js";
+import { initCatalog, collectDiagnostics, wireCatalogControls } from "./catalog.js";
+import { initNotifications, notifyFailure, dismissFailuresByJobId } from "./notifications.js";
+import { runStoreMigrationIfNeeded } from "./utils.js";
+import { ignoredByShortcuts } from "./libraryDeleteKey.js";
+import { initI18n, applyTranslations, t, plural, onLanguageChange } from "./i18n.js";
+import { initFooterFit, refitFooter } from "./footerFit.js";
+import { externalLinkAction } from "./externalLinks.js";
+import { initArtistInfo } from "./artistInfo.js";
+import { initLyrics } from "./lyrics.js";
+import { initHelpMode } from "./helpMode.js";
+import { initVideoTake } from "./video/videoTake.js";
+import { initMasterPanel } from "./masterPanel.js";
+import { initModeUi } from "./modeUi.js";
+import { initKaraoke, isKaraokeOpen } from "./karaoke/karaoke.js";
+import { initStreamer, isStreamerOpen, isStreamerTakeOpen } from "./streamer/streamer.js";
+import { isRecording } from "./capture/recordUi.js";
+import { initMixMode } from "./mixMode.js";
+import { initModeStems } from "./modeStems.js";
+import { initStemsControl } from "./stemsControl.js";
+import { applyVocalSplitHealth, onVocalSplitAvailability, vocalSplitUnavailable, vocalSplitUnavailableText, effectiveVocalSplitMode } from "./vocalSplitState.js";
+
+// ─── Stem choice toggles on the import page ───
+//
+// Filter-chip semantics (Spotify-style). The natural mental model when
+// a user sees all 6 stems lit up is "everything is extracted"; when
+// they then click ONE chip, they expect "now only this one". A plain
+// toggle inverts the clicked chip and leaves the others on, which
+// reads as "I just deselected the one I wanted" -- exactly the user
+// confusion that prompted this fix.
+//
+// Algorithm:
+//  - "All selected" is the implicit default (no filter applied).
+//  - First click on a chip while in default state switches to
+//    "only this stem" (clears all others).
+//  - Subsequent clicks on inactive chips ADD them to the filter.
+//  - Clicks on the only-selected chip clear it; if that empties the
+//    selection, we revert to "all selected" (wraparound).
+//
+// Persisted across reloads so the next song honors the user's last
+// chosen subset, but a 0-selection state is normalized to all 6.
+//
+// What the row looks like at any moment lives in stemChoice.js, so the chips,
+// the All button and the toggle below cannot disagree about it. Only the
+// rules above are here.
+
+// ─── Vocals: Combined / Lead + Backing toggle (on-demand split, #275) ───
+//
+// Two buttons, three states, and either of them can switch the vocals on.
+//
+// Vocals is the one stem with something to say about how it comes out, so the
+// pair carries a state the other chips do not have: as one track, split into
+// lead and backing, or not extracted at all. Neither button lit is that third
+// state, and the chip beside them agrees with it. Pressing the mode already in
+// force switches vocals off; pressing the other switches mode and leaves them
+// on; pressing either from cold switches them on in that mode.
+//
+// The chip is a way in as well, and the shorter one: it switches vocals on as
+// Combined without a second press. The modes were hidden, and later dimmed,
+// until that chip had been pressed, which made saying how you want the vocals
+// split something you could only do after asking for them.
+//
+// Which of the two is lit is decided in refreshStemChoiceVisuals, along with
+// the chips. Painting from here as well is what put the All button a state
+// behind its own chips once already (#658): two painters for one fact, and the
+// one reachable by a click is never the one that is wrong.
+
+function wireVocalModeToggle() {
+  const wrap = document.getElementById("vocalModeToggle");
+  if (!wrap) return;
+  for (const btn of wrap.querySelectorAll(".vocal-mode-btn")) {
+    btn.addEventListener("click", () => {
+      const mode = btn.dataset.mode;
+      // Lead + Backing cannot be made on this install (#832): say why,
+      // which a tooltip alone does not on a touch screen, and change nothing.
+      if (mode === "split" && vocalSplitUnavailable()) {
+        showError(vocalSplitUnavailableText(), null, { retry: false });
+        return;
+      }
+      // The mode as lit (Combined while Lead + Backing is unavailable), so
+      // pressing the lit button always switches vocals off.
+      if (selectedStems.has("vocals") && effectiveVocalSplitMode() === mode) {
+        // Pressing the mode that is already in force is how vocals are turned
+        // off, the same way pressing any other lit chip switches that stem off.
+        selectedStems.delete("vocals");
+      } else {
+        setVocalSplitMode(mode);
+        selectedStems.add("vocals");
+      }
+      saveSelectedStems();
+      refreshStemChoiceVisuals();
+      buildStripStems();
+    });
+  }
+  // The answer comes from /api/health (wireFooterControls reads it), or from
+  // a split that just found a dependency missing.
+  onVocalSplitAvailability(() => refreshStemChoiceVisuals());
+  onLanguageChange(() => refreshStemChoiceVisuals());
+}
+
+// ─── Experimental song-structure extraction ───
+//
+// The server owns this flag, not the browser: the pipeline reads it per job,
+// so a phone and a laptop pointed at the same TetalStem must not disagree about
+// whether the next import pays for an inference pass. The button therefore
+// reflects the server's answer and writes back, rather than keeping its own
+// local state.
+function wireAutoSectionsToggle() {
+  const btn = document.getElementById("autoSectionsBtn");
+  if (!btn) return;
+  const paint = (on) => btn.setAttribute("aria-pressed", String(!!on));
+
+  // Bound before the state is fetched, so an early click is never dropped and
+  // a settings request that never returns cannot leave the button inert.
+  btn.addEventListener("click", async () => {
+    const next = btn.getAttribute("aria-pressed") !== "true";
+    paint(next);
+    btn.disabled = true;
+    try {
+      const r = await fetch("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ auto_sections: next }),
+      });
+      if (!r.ok) throw new Error(String(r.status));
+      paint((await r.json()).auto_sections);
+    } catch (e) {
+      console.warn("[structure] could not save the setting:", e);
+      paint(!next); // the server did not take it, so do not claim it did
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  // Off is the only state this starts in. It is a choice about the next import,
+  // not a preference: an inference pass costs minutes of CPU, so it should
+  // always be something the user asked for just now rather than something a
+  // previous session, or the previous song, left switched on.
+  //
+  // The server is what the runner actually reads, so turning the button off is
+  // not enough on its own -- the setting has to go with it, or the next import
+  // would still pay for a pass nobody asked for.
+  const forceOff = async () => {
+    if (btn.getAttribute("aria-pressed") !== "true") return;
+    paint(false);
+    try {
+      await fetch("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ auto_sections: false }),
+      });
+    } catch (e) {
+      console.warn("[structure] could not clear the setting:", e);
+    }
+  };
+  setAutoSectionsResetFn(forceOff);
+
+  // Read it once at startup only to find out whether it needs clearing: a
+  // setting left on by an earlier session must not survive into this one.
+  fetch("/api/settings", { cache: "no-store" })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((d) => {
+      if (!d) return;
+      paint(d.auto_sections);
+      return forceOff();
+    })
+    .catch((e) => console.warn("[structure] could not read the setting:", e));
+}
+
+// Detect lyrics: whether the next imports look for lyrics (LRCLIB, then a
+// transcript of the vocals). Off by default. Unlike Detect structure it is a
+// standing choice, kept on the server until changed, so the button shows the
+// server's answer at startup and writes back on click.
+function wireAutoLyricsToggle() {
+  const btn = document.getElementById("autoLyricsBtn");
+  if (!btn) return;
+  const paint = (on) => btn.setAttribute("aria-pressed", String(!!on));
+  btn.addEventListener("click", async () => {
+    const next = btn.getAttribute("aria-pressed") !== "true";
+    paint(next);
+    btn.disabled = true;
+    try {
+      const r = await fetch("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ auto_lyrics: next }),
+      });
+      if (!r.ok) throw new Error(String(r.status));
+      paint((await r.json()).auto_lyrics);
+    } catch (e) {
+      console.warn("[lyrics] could not save the setting:", e);
+      paint(!next); // the server did not take it, so do not claim it did
+    } finally {
+      btn.disabled = false;
+    }
+  });
+  fetch("/api/settings", { cache: "no-store" })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((d) => { if (d) paint(d.auto_lyrics); })
+    .catch((e) => console.warn("[lyrics] could not read the setting:", e));
+}
+
+function handleStemChoiceClick(stem) {
+  const allSelected = selectedStems.size === STEM_NAMES.length;
+  const hadVocals = selectedStems.has("vocals");
+  if (allSelected) {
+    // Default state -> switch to "only this stem".
+    selectedStems.clear();
+    selectedStems.add(stem);
+  } else if (selectedStems.has(stem)) {
+    // A press that says "not this one" is answered with exactly that, even
+    // when it is the last one lit.
+    //
+    // Emptying the set used to refill it with all six, so narrowing down to
+    // Vocals and pressing it once more turned everything back on: the opposite
+    // of what was asked, and no way to switch that stem off at all. Refusing
+    // the press instead is no better, because then the last stem cannot be
+    // turned off either.
+    //
+    // An empty row is not a state that needs preventing here. All already
+    // reaches it, in one press, and it is the control whose job that is.
+    selectedStems.delete(stem);
+  } else {
+    selectedStems.add(stem);
+  }
+
+  // Vocals switched on from its own chip has not been told which of the two
+  // ways it should come out, so it takes Combined. Only on the transition: a
+  // press that narrows an already-selected set down to Vocals is not a change
+  // of mind about the mode, and the mode buttons set their own.
+  if (!hadVocals && selectedStems.has("vocals")) setVocalSplitMode("all");
+
+  saveSelectedStems();
+  refreshStemChoiceVisuals();
+  buildStripStems();
+}
+
+function wireStemChoiceButtons() {
+  refreshStemChoiceVisuals();
+  for (const btn of document.querySelectorAll(".stem-choice[data-stem]")) {
+    btn.addEventListener("click", () => handleStemChoiceClick(btn.dataset.stem));
+  }
+}
+
+// ─── Extract chips: what happens when they stop fitting ───
+//
+// The row never wraps. Whichever chips no longer fit move into a panel behind
+// a three-dot button, one at a time, from the end of the row.
+//
+// Wrapping was the alternative and it is the wrong one: the bar went from 96px
+// tall to 168 and then 236 as the chips spilled onto further lines, growing
+// exactly as the window shrank, and leaving the controls on the right stranded
+// at the top of a column stretched by chips they have nothing to do with.
+//
+// The order is fixed once, at wiring time, because the measuring below puts
+// everything back inline before it decides and the DOM order is the only
+// record of where each chip belongs.
+
+let _stemChipOrder = null;
+
+/**
+ * Move whatever does not fit into the overflow panel, and nothing more.
+ *
+ * Measured from the row's own clientWidth rather than from a breakpoint: the
+ * chips are seven different widths in ten languages, so the width at which the
+ * fifth one stops fitting is not a number anyone can write down.
+ *
+ * Everything goes back inline first. Deciding from the current, already
+ * collapsed state would mean the row could only ever lose chips and never get
+ * them back as the window grew, which is the same trap the footer's own fit
+ * logic documents.
+ */
+function fitStemChips() {
+  const row = document.getElementById("stemChips");
+  const panel = document.getElementById("stemOverflow");
+  const btn = document.getElementById("stemMoreBtn");
+  if (!row || !panel || !btn || !_stemChipOrder) return;
+
+  for (const el of _stemChipOrder) row.appendChild(el);
+  // Both measurements below are taken against a row that is not paying for the
+  // button yet, so it starts hidden and is revealed only once the answer is
+  // known to need it.
+  btn.hidden = true;
+
+  // Measured after everything is back, so the number is what the row can have
+  // rather than what it was left with. A hidden row has no width to fit
+  // anything into, and measuring one would move every chip for nothing.
+  let budget = row.clientWidth;
+  if (!budget) return;
+
+  const gap = parseFloat(getComputedStyle(row).gap) || 0;
+  // A margin is part of what a chip costs the row. The Vocals group carries a
+  // right margin to set it apart from Drums, and a rect is measured without
+  // it, so the sum came up short by exactly that margin and the last chip sat
+  // a pixel past the edge with the fitter reporting everything fitted (#673).
+  const widths = _stemChipOrder.map((el) => {
+    const cs = getComputedStyle(el);
+    return (
+      el.getBoundingClientRect().width +
+      (parseFloat(cs.marginLeft) || 0) +
+      (parseFloat(cs.marginRight) || 0)
+    );
+  });
+  const total = widths.reduce((a, w, i) => a + w + (i ? gap : 0), 0);
+
+  // Half a pixel of rounding is not an overflow; the row is overflow: hidden
+  // and a chip that fits within a pixel is drawn whole.
+  const fits = (used) => used <= budget + 0.5;
+
+  let keep = _stemChipOrder.length;
+  if (!fits(total)) {
+    // Something has to fold, so the button is going to be on screen, and it
+    // takes its width out of this row rather than out of the bar. Deciding
+    // against a budget measured without it is what made the fold stop one chip
+    // short every time it folded at all: the row lost the button's width the
+    // moment the answer was applied, and the chip that had just been measured
+    // as fitting no longer did (#673).
+    btn.hidden = false;
+    budget = row.clientWidth;
+
+    let used = 0;
+    keep = 0;
+    for (let i = 0; i < _stemChipOrder.length; i++) {
+      used += widths[i] + (i ? gap : 0);
+      if (!fits(used)) break;
+      keep = i + 1;
+    }
+  }
+
+  for (let i = keep; i < _stemChipOrder.length; i++) panel.appendChild(_stemChipOrder[i]);
+  btn.hidden = keep === _stemChipOrder.length;
+
+  // Then look at what that did, because the answer can invalidate itself.
+  //
+  // The row sits in a grid track sized from its own content, so the width it
+  // is given depends on what is in it. Folding a chip out shrinks the column,
+  // which can leave the chips that stayed overflowing a row that genuinely had
+  // room for them when they were measured. A single pass cannot see that, and
+  // Chinese at 1024 is where it showed: five chips folded, and the two left
+  // over hung 4px past an edge that had moved underneath them (#673).
+  //
+  // So fold, look again, fold again. Each turn only removes a chip, and the
+  // counter is the belt to the loop's braces.
+  let guard = _stemChipOrder.length;
+  while (keep > 0 && row.scrollWidth > row.clientWidth + 1 && guard-- > 0) {
+    keep -= 1;
+    btn.hidden = false;
+    panel.insertBefore(_stemChipOrder[keep], panel.firstChild);
+  }
+
+  btn.hidden = keep === _stemChipOrder.length;
+  if (btn.hidden) closeStemOverflow();
+}
+
+function closeStemOverflow() {
+  const panel = document.getElementById("stemOverflow");
+  const btn = document.getElementById("stemMoreBtn");
+  if (!panel || !btn) return;
+  panel.classList.remove("open");
+  btn.setAttribute("aria-expanded", "false");
+}
+
+// Fixed positioning, placed from the button's own rect, because the panel has
+// to escape the bar it is anchored in.
+function wireStemChipsPopover() {
+  const row = document.getElementById("stemChips");
+  const panel = document.getElementById("stemOverflow");
+  const btn = document.getElementById("stemMoreBtn");
+  if (!row || !panel || !btn) return;
+
+  _stemChipOrder = [...row.children];
+
+  const isOpen = () => btn.getAttribute("aria-expanded") === "true";
+
+  btn.addEventListener("click", (e) => {
+    // Stops the document handler below reading the press that opened the panel
+    // as the click away that shuts it.
+    e.stopPropagation();
+    if (isOpen()) return closeStemOverflow();
+    panel.classList.add("open");
+    btn.setAttribute("aria-expanded", "true");
+    const r = btn.getBoundingClientRect();
+    panel.style.left = `${Math.max(8, Math.min(Math.round(r.left), window.innerWidth - panel.offsetWidth - 8))}px`;
+    panel.style.top = `${Math.round(r.bottom + 6)}px`;
+  });
+
+  // A click on a chip is a click on a control, not a click away from it: the
+  // selection is meant to be changed several times with the panel open.
+  panel.addEventListener("click", (e) => e.stopPropagation());
+  document.addEventListener("click", closeStemOverflow);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && isOpen()) {
+      closeStemOverflow();
+      btn.focus();
+    }
+  });
+
+  // Watch the composer, not the chip row.
+  //
+  // The row is what this function moves things out of, and the column it sits
+  // in is sized by its content, so emptying it shrinks it: at a narrow window
+  // the row collapsed to 127px, and widening the window never widened it back
+  // because the chips that would have done so were in the panel. The observer
+  // then had nothing to report and the chips never came home. Measuring the
+  // thing you are changing.
+  //
+  // The composer's width tracks the window and the sidebar without depending
+  // on where any chip currently lives, so it is the honest trigger. The window
+  // resize below is a belt-and-braces second one.
+  //
+  // Coalesced because a drag on the window edge fires this every frame.
+  let queued = false;
+  const refit = () => {
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(() => {
+      queued = false;
+      fitStemChips();
+    });
+  };
+  const composer = row.closest(".daw-composer") || row;
+  if (typeof ResizeObserver === "function") new ResizeObserver(refit).observe(composer);
+  window.addEventListener("resize", () => {
+    closeStemOverflow();
+    refit();
+  });
+
+  fitStemChips();
+}
+
+function wireAllButton() {
+  const allBtn = document.getElementById("stemAllBtn");
+  if (!allBtn) return;
+
+  allBtn.addEventListener("click", () => {
+    const allSelected = selectedStems.size === STEM_NAMES.length;
+    if (allSelected) {
+      selectedStems.clear();
+    } else {
+      for (const n of STEM_NAMES) selectedStems.add(n);
+    }
+    saveSelectedStems();
+    refreshStemChoiceVisuals();
+    buildStripStems();
+  });
+
+  // No second listener on the stem chips, and no sync of its own. The button
+  // is painted from the selection like everything else in the row, by the one
+  // function every path goes through. A private syncAllBtn here was reachable
+  // only from a click, which is how two stems could sit selected under a lit
+  // All on every page load (#658).
+  refreshStemChoiceVisuals();
+}
+
+// ─── Wire everything up ───
+
+// Applied as early as possible in module execution, ahead of every other
+// top-level call below, to minimize the flash of English before the DOM
+// gets its real language (unavoidable without server-side rendering, since
+// static/index.html always ships pre-rendered in English).
+const i18nReady = initI18n().then(() => applyTranslations(document));
+
+syncStemNamesFromAPI().then(() => buildStripStems());
+wireJobForm();
+// Live search on the topbar box. Picking a result fills the box and stops
+// there: extraction is minutes of work, so it stays behind the deliberate
+// press of Process rather than starting on a click in a list the user may
+// still be reading. The import flow (single track, playlist, capacity, stems)
+// is untouched, and search never learns about any of it.
+initSearch((item) => {
+  const urlInput = document.getElementById("url");
+  if (!urlInput) return;
+  urlInput.value = item.url;
+  // Fire input so anything listening to the box (the drop zone, the file pill)
+  // sees the new value, then leave the caret where a correction would go.
+  urlInput.dispatchEvent(new Event("input", { bubbles: true }));
+  urlInput.focus();
+  urlInput.setSelectionRange(urlInput.value.length, urlInput.value.length);
+});
+wireTransportButtons();
+// Sections deliberately does not import the transport, so that it stays
+// loadable without a DOM. This is the one place that owns both.
+setSectionsLoopBridge({
+  getLoop: () => ({ enabled: loopEnabled, start: loopStart, end: loopEnd }),
+  setLoopRange,
+});
+onLoopChange(refreshSectionsAddState);
+// Tags (#1075) the same way: where the playhead is, and move it.
+setTimelineTagsBridge({
+  getTime: () => transport()?.getCurrentTime() ?? null,
+  seek: setPlayheadTime,
+  // The marker loop buttons arm the same loop a section does.
+  getLoop: () => ({ enabled: loopEnabled, start: loopStart, end: loopEnd }),
+  setLoopRange,
+  clearLoop,
+});
+onLoopChange(refreshTagLoopState);
+wireBeatGridUi();
+wireFooterControls();
+wireStemListControls();
+wireStemChoiceButtons();
+wireAllButton();
+wireVocalModeToggle();
+wireStemChipsPopover();
+wireAutoSectionsToggle();
+wireAutoLyricsToggle();
+wireFileDrop();
+wireAppShellControls();
+initFooterFit();
+initArtistInfo();
+initLyrics();
+initHelpMode();
+// Camera in the record flow and "Make video" (static/js/video/). Async only to
+// load the capture modules; a failure there must not stop the studio.
+initVideoTake().catch((err) => console.warn("[video] init failed:", err));
+initMasterPanel();
+initModeUi();
+initMixMode();
+initModeStems();
+initStemsControl();
+initKaraoke();
+initStreamer();
+// Re-measure after a language switch. Measured across en/fr/de/pl the strip
+// came out the same width in all four, because the group labels are 10px
+// uppercase and narrower than the controls under them, so this is not the
+// reason the fit is computed rather than written as a breakpoint (that is the
+// sidebar, see footerFit.js). It is here because select options and button
+// text do vary, and re-measuring costs one frame.
+onLanguageChange(refitFooter);
+// Every chip's label changes width with the language, so the count that fits
+// changes with it too.
+onLanguageChange(fitStemChips);
+// Here with everything else, not in initCatalog after the awaits below: on
+// the desktop app each of those is a round trip to the shell, and a press on
+// Settings in that time used to do nothing (#1010).
+wireCatalogControls({ languageReady: i18nReady });
+
+(async () => {
+  await i18nReady;
+  // Waits for the language to be resolved: the empty shell's stem labels
+  // (STEM_DISPLAY) are a one-time textContent snapshot, not a live binding,
+  // so rendering it before i18n is ready would freeze it in English
+  // regardless of the stored language preference.
+  renderEmptyShell();
+  await runStoreMigrationIfNeeded();
+  await stemSelectionReady;
+  refreshStemChoiceVisuals();
+  // Both halves of the Extract row's state arrive asynchronously, so the row is
+  // painted once more when the second of them lands.
+  await vocalSplitModeReady;
+  refreshStemChoiceVisuals();
+  // Before initCatalog: it runs the update check, which can itself notify.
+  // collectDiagnostics is injected rather than imported by notifications.js,
+  // which would make the two modules import each other.
+  await initNotifications({ diagnostics: collectDiagnostics });
+  await initCatalog();
+})().catch(console.error);
+
+// ─── Footer: speed dropdown, export dropdown, scrub seek ───
+
+function wireFooterControls() {
+  // ── Export split-button dropdown ──
+  // The full button toggles the export menu. Export actions live inside
+  // the dropdown so the hit target is predictable.
+  // The menu offers Mix / All Stems / Current Region, with a WAV/MP3 toggle in
+  // the header. All exports reuse the backend-served download helpers.
+  const exportBtn   = document.getElementById("t-export-btn");
+  const exportPanel = document.getElementById("t-export-panel");
+  const exportLabel = document.getElementById("t-export-label");
+  const fmtWav   = document.getElementById("t-fmt-wav");
+  const fmtMp3   = document.getElementById("t-fmt-mp3");
+  const fmtFlac  = document.getElementById("t-fmt-flac");
+  const fmtOgg   = document.getElementById("t-fmt-ogg");
+  const fmtMp4   = document.getElementById("t-fmt-mp4");
+  const exportWrap = document.getElementById("footer-export-wrap");
+  const itemMix    = document.getElementById("t-export-mix");
+  const itemStems  = document.getElementById("t-export-stems");
+  const itemRegion = document.getElementById("t-export-region");
+  const itemReaper = document.getElementById("t-export-reaper");
+  const itemOpenReaper = document.getElementById("t-export-open-reaper");
+  // Open in REAPER needs the desktop app (it unpacks the project on disk and
+  // launches REAPER, which a browser download cannot do) and a REAPER to
+  // launch: the one chosen in Settings > External editors, or one found where
+  // its installer puts it. Asked again each time the menu opens, so
+  // installing REAPER or choosing it in Settings shows the row without a
+  // restart. A shell without the command keeps the row hidden.
+  async function refreshOpenReaperRow() {
+    const invoke = window.__TAURI__?.core?.invoke;
+    if (!itemOpenReaper || !invoke) return;
+    try {
+      const status = await invoke("reaper_status");
+      itemOpenReaper.hidden = !status?.path;
+    } catch (e) {
+      console.warn("[export] could not look for REAPER:", e);
+      itemOpenReaper.hidden = true;
+    }
+  }
+  refreshOpenReaperRow();
+  const mixDescEl  = itemMix?.querySelector(".chip-item-desc");
+  const allItems = () => [itemMix, itemStems, itemReaper, itemOpenReaper, itemRegion];
+  // Only the rows actually visible in the current format mode (MP4 hides the
+  // audio-only Stems/REAPER/Region rows).
+  const actionItems = () => allItems().filter((it) => it && it.offsetParent !== null);
+
+  // MP4 is a format choice, shown only for jobs with a preserved video track.
+  // It applies to the mix only — stems/region are audio-only.
+  const videoAvailable = () => !!exportWrap?.classList.contains("has-video");
+
+  let format = "wav";
+  // OGG needs an FFmpeg with libvorbis, which is optional (#824). The
+  // backend's /api/health says which formats its FFmpeg can encode. Without
+  // libvorbis the OGG button stays visible but disabled, with the reason
+  // under it. An unknown answer (an older backend, a failed probe) leaves OGG
+  // offered as before, and the backend still refuses it with a clear message.
+  let oggUnavailable = false;
+  let busy = false;
+  // True from the click until the transfer starts or the dialog is cancelled.
+  let picking = false;
+
+  const panelOpen = () => exportPanel && !exportPanel.classList.contains("hidden");
+  function openPanel() {
+    closeAllChipPanels();
+    // A previous (video) job may have left MP4 selected; revert if unavailable now.
+    if (format === "mp4" && !videoAvailable()) setFormat("wav");
+    applyTransposeGate();
+    refreshOpenReaperRow();
+    exportPanel?.classList.remove("hidden");
+    exportBtn?.setAttribute("aria-expanded", "true");
+  }
+  function closePanel() {
+    exportPanel?.classList.add("hidden");
+    exportBtn?.setAttribute("aria-expanded", "false");
+  }
+
+  function setFormat(f) {
+    format = f;
+    for (const [btn, val] of [[fmtWav, "wav"], [fmtMp3, "mp3"], [fmtFlac, "flac"], [fmtOgg, "ogg"], [fmtMp4, "mp4"]]) {
+      btn?.classList.toggle("active", f === val);
+      btn?.setAttribute("aria-checked", String(f === val));
+    }
+    applyFormatState();
+    // applyFormatState gives the region row back its loop state; a held-back
+    // transposed mix keeps it disabled.
+    if (panelOpen()) applyTransposeGate();
+  }
+  fmtWav?.addEventListener("click", (e) => { e.stopPropagation(); setFormat("wav"); });
+  fmtMp3?.addEventListener("click", (e) => { e.stopPropagation(); setFormat("mp3"); });
+  fmtFlac?.addEventListener("click", (e) => { e.stopPropagation(); setFormat("flac"); });
+  fmtOgg?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (oggUnavailable) return;
+    setFormat("ogg");
+  });
+  fmtMp4?.addEventListener("click", (e) => { e.stopPropagation(); setFormat("mp4"); });
+
+  // MP4 exports the mix muxed with the source video. Stems and region have no
+  // video equivalent, so they're hidden (via .fmt-mp4) while MP4 is selected,
+  // leaving just "Export Mix".
+  function applyFormatState() {
+    const video = format === "mp4";
+    exportPanel?.classList.toggle("fmt-mp4", video);
+    if (mixDescEl) {
+      mixDescEl.textContent = video ? t("export.mixDescVideo") : t("export.mixDesc");
+    }
+    if (!video) updateLoopRegionVisual(); // restores the region item's disabled state
+  }
+  // mixDescEl's text depends on `format`, not just the current language, so a
+  // language switch needs to re-derive it rather than rely solely on the
+  // generic data-i18n pass (which would otherwise reset it to the non-video
+  // wording even while MP4 is selected).
+  onLanguageChange(applyFormatState);
+
+  function applyOggAvailability() {
+    if (!fmtOgg) return;
+    fmtOgg.setAttribute("aria-disabled", String(oggUnavailable));
+    if (oggUnavailable) fmtOgg.title = t("export.oggUnavailable");
+    else fmtOgg.removeAttribute("title");
+    exportPanel?.classList.toggle("ogg-unavailable", oggUnavailable);
+    if (oggUnavailable && format === "ogg") setFormat("wav");
+  }
+  onLanguageChange(applyOggAvailability);
+
+  // A transposed mix needs FFmpeg's rubberband filter to export, which the
+  // macOS download and Homebrew's plain FFmpeg do not have (#858). Then Mix,
+  // Region and MP4 (all send the keys) are held back with the reason in the
+  // menu, and the stems zip (never transposed) stays. Worked out when the menu
+  // opens and again on a click, since a key can change while it is open; a
+  // mix with every key at 0, or an unknown answer, changes nothing.
+  let transposeBlocked = false;
+  function applyTransposeGate() {
+    transposeBlocked = mixTransposeBlocked();
+    exportPanel?.classList.toggle("transpose-unavailable", transposeBlocked);
+    for (const it of [itemMix, itemRegion]) {
+      if (!it) continue;
+      if (transposeBlocked) {
+        it.setAttribute("aria-disabled", "true");
+        it.title = t("export.transposeUnavailable");
+      } else {
+        it.removeAttribute("title");
+      }
+    }
+    if (!transposeBlocked && !busy) {
+      itemMix?.removeAttribute("aria-disabled");
+      applyFormatState(); // gives the region row back its own disabled state
+    }
+  }
+  onLanguageChange(() => { if (transposeBlocked) applyTransposeGate(); });
+
+  fetch("/api/health", { cache: "no-store" })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((health) => {
+      oggUnavailable = health?.export_formats?.ogg === false;
+      applyOggAvailability();
+      setTransposeExportAvailable(transposeExportFromHealth(health));
+      if (panelOpen()) applyTransposeGate();
+      // The same answer says whether Lead + Backing can be made (#832).
+      applyVocalSplitHealth(health);
+      // An FFmpeg older than 5.1 cannot run any export: say so now, not at
+      // the first export.
+      if (health?.ffmpeg_too_old) {
+        showError(t("export.ffmpegTooOld", { version: health.ffmpeg_too_old }), null, { retry: false });
+      }
+    })
+    .catch((e) => console.warn("[export] format check failed:", e));
+
+  function resetBusy() {
+    busy = false;
+    exportBtn?.classList.remove("is-busy");
+    if (exportLabel) exportLabel.textContent = t("export.mix");
+    // Clear every row, not just the ones enterBusy could see: it disables via
+    // actionItems(), which filters on visibility, and it closes the panel, so
+    // by the time this runs every row is hidden and a visibility-filtered clear
+    // would clear nothing at all -- leaving the menu dead for the rest of the
+    // session (#335).
+    for (const it of allItems()) it?.removeAttribute("aria-disabled");
+    applyFormatState(); // re-derives the region row's genuine disabled state
+  }
+
+  // How long to hold the indeterminate state when the host reports nothing back.
+  const EXPORT_FLASH_MS = 1200;
+  // Safety net for the promise path: a pending invoke that somehow never settles
+  // must not leave the menu disabled for the rest of the session (#335).
+  const EXPORT_BUSY_MAX_MS = 15 * 60 * 1000;
+  // Guards against a stale timer from a finished export resetting a later one.
+  let busyToken = 0;
+
+  // Show the busy state. Called when bytes actually start moving, which on
+  // desktop is after the user has picked a destination -- not on click, or the
+  // label would claim to be exporting for as long as the save dialog sat open
+  // (#338).
+  function enterBusy() {
+    busy = true;
+    exportBtn?.classList.add("is-busy");
+    if (exportLabel) exportLabel.textContent = t("export.mixing");
+    actionItems().forEach((it) => it?.setAttribute("aria-disabled", "true"));
+    closePanel();
+  }
+  // Same reasoning as applyFormatState's listener above: exportLabel's text
+  // depends on `busy`, so re-derive it after a language switch instead of
+  // leaving it on whatever the generic data-i18n pass reset it to.
+  onLanguageChange(() => {
+    if (exportLabel) exportLabel.textContent = t(busy ? "export.mixing" : "export.mix");
+  });
+
+  // `pending` is whatever the download helper returned: a promise on desktop,
+  // resolving once the file is written, or `true` in a browser, where an
+  // <a download> is fire-and-forget and there is nothing to wait on. Only the
+  // guess needs a fixed duration.
+  //
+  // `picking` covers the gap between the click and the transfer: the dialog is
+  // app-modal so the menu is unreachable anyway, but the flag keeps a second
+  // export from being queued behind it without lying about the label.
+  // jobId is snapshotted by the caller at click time, not read live here:
+  // settlement can take up to EXPORT_BUSY_MAX_MS, by which point the user may
+  // have opened a different track, and currentJobId would then point at the
+  // wrong one (#401).
+  function settleBusy(pending, jobId) {
+    const token = ++busyToken;
+    const finish = () => {
+      picking = false;
+      if (token === busyToken) resetBusy();
+    };
+
+    if (!pending || typeof pending.then !== "function") {
+      window.setTimeout(finish, EXPORT_FLASH_MS);
+      return;
+    }
+    const backstop = window.setTimeout(finish, EXPORT_BUSY_MAX_MS);
+    pending
+      .then((ok) => {
+        // ok === false means the save dialog was cancelled, not a real
+        // export — nothing was resolved, so leave any failure notification
+        // in place rather than clearing it on a no-op.
+        if (jobId && ok !== false) dismissFailuresByJobId(jobId, "export");
+      })
+      .catch((err) => {
+        // A cancelled dialog resolves false without ever entering the busy
+        // state, so anything here is a real failure.
+        const message = typeof err === "string" && err ? err : t("export.failed");
+        showError(message, null, { retry: false });
+        notifyFailure({
+          kind: "export",
+          message,
+          detail: err instanceof Error ? String(err.message) : null,
+          context: { stage: `Exporting ${format}`, jobId },
+        });
+      })
+      .finally(() => {
+        window.clearTimeout(backstop);
+        finish();
+      });
+  }
+
+  // Kick off an export: hand the helper a callback that flips the UI into its
+  // busy state, then wait on the result.
+  function runExport(start, emptyMessage) {
+    if (busy || picking) return;
+    picking = true;
+    const jobId = currentJobId; // snapshot now -- see settleBusy's comment
+    const pending = start(enterBusy);
+    if (!pending) {
+      picking = false;
+      showError(emptyMessage, null, { retry: false });
+      return;
+    }
+    settleBusy(pending, jobId);
+  }
+
+  exportBtn?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (busy || picking) return;
+    panelOpen() ? closePanel() : openPanel();
+  });
+
+  // Export Mix: MP4 produces the video; any other format an audio mix.
+  itemMix?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    applyTransposeGate();
+    if (transposeBlocked) return;
+    runExport(
+      (onStart) => (format === "mp4" ? downloadCurrentVideo(onStart) : downloadCurrentMix(format, onStart)),
+      t("export.allMuted"),
+    );
+  });
+
+  itemRegion?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    applyTransposeGate();
+    if (itemRegion.getAttribute("aria-disabled") === "true") return;
+    runExport((onStart) => downloadRegionMix(format, onStart), t("export.allMuted"));
+  });
+
+  // All Stems = a single backend-built ZIP, named after the song. Audio-only,
+  // so it's disabled (and inert) while MP4 is the selected format.
+  itemStems?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (itemStems.getAttribute("aria-disabled") === "true") return;
+    runExport((onStart) => downloadAllStemsZip(format, onStart), t("export.noStems"));
+  });
+
+  // The same zip plus a REAPER project (.rpp) naming every file in it.
+  itemReaper?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (itemReaper.getAttribute("aria-disabled") === "true") return;
+    runExport((onStart) => downloadAllStemsZip(format, onStart, { reaper: true }), t("export.noStems"));
+  });
+
+  // Desktop only: save that zip, unpack it into a folder beside it and open
+  // the project with the system's app for .rpp files.
+  itemOpenReaper?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (itemOpenReaper.getAttribute("aria-disabled") === "true") return;
+    runExport((onStart) => openStemsInReaper(format, onStart), t("export.noStems"));
+  });
+
+  // Keyboard: ↓ opens/moves into the menu, ↑/↓ cycle rows, Esc closes + restores focus.
+  exportBtn?.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      if (!panelOpen()) openPanel();
+      actionItems().find((it) => it?.getAttribute("aria-disabled") !== "true")?.focus();
+    }
+  });
+  exportPanel?.addEventListener("keydown", (e) => {
+    const focusable = actionItems().filter((it) => it && it.getAttribute("aria-disabled") !== "true");
+    const idx = focusable.indexOf(document.activeElement);
+    if (e.key === "Escape") { closePanel(); exportBtn?.focus(); }
+    else if (e.key === "ArrowDown") { e.preventDefault(); focusable[(idx + 1) % focusable.length]?.focus(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); focusable[(idx - 1 + focusable.length) % focusable.length]?.focus(); }
+  });
+
+  // ── Close panels on outside click ──
+  // Inside the menu is not "away": ticking an option must not dismiss it. The
+  // export panel carries two checkboxes (click track, count-in) that a user
+  // may well want both of, and without this the first tick closed the menu and
+  // the second needed it reopened. Rows that *should* close the menu do it
+  // themselves -- the export actions via enterBusy() -> closePanel().
+  exportPanel?.addEventListener("click", (e) => e.stopPropagation());
+  document.addEventListener("click", closeAllChipPanels);
+}
+
+function closeAllChipPanels() {
+  document.querySelectorAll(".track-chip-panel:not(.hidden)").forEach((p) => {
+    p.classList.add("hidden");
+    p.previousElementSibling?.setAttribute("aria-expanded", "false");
+  });
+}
+
+// ─── File drop on URL input ───
+
+function wireFileDrop() {
+  const urlWrap = document.querySelector(".url-wrap");
+  const urlInput = document.getElementById("url");
+  const fileInput = document.getElementById("fileInput");
+  const filePill = document.getElementById("filePill");
+  const fileName = document.getElementById("fileName");
+  const fileSize = document.getElementById("fileSize");
+  const fileClear = document.getElementById("fileClear");
+  const dropError = document.getElementById("urlDropError");
+  if (!urlWrap || !urlInput || !fileInput || !filePill) return;
+
+  // Why a dropped file was refused, said in the box it was aimed at.
+  //
+  // showError() is the panel for a job that failed: it takes over a region and
+  // carries a retry button. A file the importer declined before anything
+  // started has nothing to retry and does not deserve that much room, and the
+  // reason belongs next to the gesture rather than somewhere else on screen.
+  //
+  // Cleared on the next drop, on typing, and on a timer, so it can never be
+  // mistaken for the state of a file that is currently armed.
+  let dropErrorTimer = null;
+  function showDropError(message) {
+    if (!dropError) return;
+    dropError.textContent = message;
+    dropError.classList.remove("hidden");
+    urlWrap.classList.add("has-drop-error");
+    clearTimeout(dropErrorTimer);
+    dropErrorTimer = setTimeout(clearDropError, 6000);
+  }
+  function clearDropError() {
+    clearTimeout(dropErrorTimer);
+    dropError?.classList.add("hidden");
+    urlWrap.classList.remove("has-drop-error");
+    if (dropError) dropError.textContent = "";
+  }
+  urlInput.addEventListener("input", clearDropError);
+
+  function formatBytes(n) {
+    return n < 1024 * 1024 ? `${(n / 1024).toFixed(0)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`;
+  }
+
+  const MAX_UPLOAD_BYTES = 400 * 1024 * 1024; // must match server _MAX_UPLOAD_BYTES
+
+  const AUDIO_EXTS = [".mp3", ".wav", ".flac", ".mp4", ".m4a", ".ogg", ".opus"];
+  const isAudioFile = (file) => AUDIO_EXTS.some((ext) => file.name.toLowerCase().endsWith(ext));
+
+  /**
+   * Which of a set of picked or dropped files can be staged, and why the rest
+   * cannot.
+   *
+   * Works on anything with a name and a size rather than on File objects, so a
+   * native drop can be screened before any of its bytes are read: a file that
+   * is going to be refused should not be loaded into memory to find that out.
+   * Returns null, having said why, when nothing can be staged.
+   */
+  function screenFiles(list) {
+    const all = [...(list || [])];
+    if (!all.length) return null;
+
+    // Filter here rather than letting the server reject each one: dropping a
+    // folder, or a folder of mixed content, would otherwise mean one 422 per
+    // stray file. Only complain if nothing usable came through.
+    const audio = all.filter(isAudioFile);
+    if (!audio.length) {
+      showDropError(t("upload.unsupportedFormat"));
+      return null;
+    }
+    const files = audio.filter((f) => f.size <= MAX_UPLOAD_BYTES);
+    const oversized = audio.length - files.length;
+    if (!files.length) {
+      showDropError(t("upload.fileTooLarge", { size: formatBytes(audio[0].size), max: formatBytes(MAX_UPLOAD_BYTES) }));
+      return null;
+    }
+    return { files, skipped: all.length - files.length, oversized };
+  }
+
+  function applyFiles(fileList) {
+    const screened = screenFiles(fileList);
+    if (screened) stageFiles(screened);
+  }
+
+  /** Arms the import with files that have already passed screenFiles. */
+  function stageFiles({ files, skipped, oversized }) {
+    if (fileName) {
+      fileName.textContent =
+        files.length === 1 ? files[0].name : `${files.length} files`;
+    }
+    if (fileSize) {
+      const bytes = files.reduce((sum, f) => sum + f.size, 0);
+      fileSize.textContent = formatBytes(bytes);
+    }
+    clearDropError();
+    filePill.classList.remove("hidden");
+    urlWrap.classList.add("has-file");
+    // Cache the File objects directly on the element so job.js can always
+    // retrieve them even after the browser clears fileInput.files following
+    // a fetch() submission (known WKWebView / Chromium behaviour). _file stays
+    // as the first one so any older single-file reader keeps working.
+    fileInput._files = files;
+    fileInput._file = files[0];
+    const dt = new DataTransfer();
+    for (const f of files) dt.items.add(f);
+    fileInput.files = dt.files;
+    urlInput.value = "";
+    urlInput.removeAttribute("required");
+
+    if (skipped > 0) {
+      const reason = t(oversized > 0 ? "upload.reasonTooLarge" : "upload.reasonNotAudio");
+      showError(plural("upload.skippedFiles", skipped, { reason }), null, {
+        retry: false,
+      });
+    }
+  }
+
+  function clearFile() {
+    filePill.classList.add("hidden");
+    urlWrap.classList.remove("has-file");
+    fileInput._file = null;
+    fileInput._files = null;
+    fileInput.value = "";
+    urlInput.setAttribute("required", "");
+  }
+
+  fileClear?.addEventListener("click", clearFile);
+  // Exposed on the element, same convention as _file above, so job.js can drop
+  // the selection once the upload has been handed to the server. Without it the
+  // chip stays armed and the (now immediately re-enabled) Process button will
+  // happily import the same file twice.
+  fileInput._clear = clearFile;
+
+  const draggingFiles = (e) => !!e.dataTransfer?.types?.includes("Files");
+
+  // The URL zone keeps its own hover affordance. It is no longer the only place
+  // a file can land, so this is now about showing where it will go rather than
+  // about being the only target that works.
+  urlWrap.addEventListener("dragover", (e) => {
+    if (!draggingFiles(e)) return;
+    urlWrap.classList.add("drag-over");
+  });
+  urlWrap.addEventListener("dragleave", (e) => {
+    if (!urlWrap.contains(e.relatedTarget)) urlWrap.classList.remove("drag-over");
+  });
+
+  // A file dropped anywhere in the window is treated as a drop on the URL zone.
+  //
+  // Not a convenience. Everywhere else was previously left to the browser,
+  // which navigates to the file: in a tab that is merely surprising, but the
+  // desktop shell has no address bar and no back button, so the window is
+  // replaced by the webview's bare media player and the only way out is to
+  // quit the app (#584). Preventing the default is what fixes that; routing it
+  // to applyFiles is what makes the gesture do the obvious thing instead of
+  // nothing.
+  //
+  // Both handlers are guarded on "Files" so the library's own drags -- tracks
+  // between folders, into the lanes, onto the trash -- are untouched. Those
+  // carry no file list, and their handlers bail before preventDefault for the
+  // same reason, so the two never see each other's gestures.
+  //
+  // dragover must preventDefault too: without it the browser refuses the drop
+  // and no drop event is ever delivered to cancel.
+  //
+  // This is the whole story on Windows, macOS and in a browser, where the drag
+  // carries "Files". It is not on Linux, where it never does: see
+  // watchNativeDrops below.
+  document.addEventListener("dragover", (e) => {
+    if (!draggingFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+  });
+  document.addEventListener("drop", (e) => {
+    if (!draggingFiles(e)) return;
+    e.preventDefault();
+    urlWrap.classList.remove("drag-over");
+    applyFiles(e.dataTransfer.files);
+  });
+
+  fileInput.addEventListener("change", () => {
+    applyFiles(fileInput.files);
+  });
+
+  watchNativeDrops();
+
+  // ── Files dropped where the WebView cannot see them (#672) ──
+  //
+  // On Linux the WebView never hands the page a dropped file. WebKitGTK
+  // reports a drag from the file manager as text/uri-list, never as "Files",
+  // so the guard above does not recognise it, and at drop time there is no
+  // File to take even if it did. Left alone, WebKit navigates the window to
+  // the file, or types its file:// URI into the URL box.
+  //
+  // So on that platform the shell takes the drop instead (dropin.rs) and this
+  // asks it what arrived. The drop reaches applyFiles's own screening and
+  // staging, so a file dropped here is refused, sized, named and armed exactly
+  // as one from the picker is. Elsewhere the HTML5 path above already works
+  // and the shell says so, and this returns at once.
+  async function watchNativeDrops() {
+    const invoke = window.__TAURI__?.core?.invoke;
+    if (!invoke) return;
+    try {
+      if (!(await invoke("native_file_drop"))) return;
+    } catch (e) {
+      console.warn("[drop] could not ask the shell about native drops:", e);
+      return;
+    }
+
+    // The shell answers each call with the next signal after `after`, or with
+    // nothing once it has waited a while. `after` starts empty, meaning "from
+    // now", and is then whatever the last answer's seq was.
+    let after = null;
+    let failures = 0;
+    for (;;) {
+      let next;
+      try {
+        next = await invoke("next_drop_signal", { after });
+        failures = 0;
+      } catch (e) {
+        // A command that keeps failing must not become a tight loop. It never
+        // should fail, so this is a pause rather than a strategy.
+        failures += 1;
+        console.warn("[drop] waiting for a drop failed:", e);
+        await new Promise((r) => setTimeout(r, Math.min(30_000, 1000 * failures)));
+        continue;
+      }
+      after = next.seq;
+      const signal = next.signal;
+      if (!signal) continue;
+      if (signal.kind === "enter") {
+        urlWrap.classList.add("drag-over");
+      } else if (signal.kind === "leave") {
+        urlWrap.classList.remove("drag-over");
+      } else if (signal.kind === "drop") {
+        urlWrap.classList.remove("drag-over");
+        await applyNativeDrop(invoke, signal.files);
+      }
+    }
+  }
+
+  // `dropped` is [{ id, name, size }]: descriptions, not files. They are
+  // screened as they are, and only what is accepted is read.
+  async function applyNativeDrop(invoke, dropped) {
+    const screened = screenFiles(dropped);
+    if (!screened) return;
+    const files = [];
+    // One at a time, so a single transfer of up to MAX_UPLOAD_BYTES is in
+    // flight rather than one per file. Every accepted file is still held until
+    // staging, as a picked one is: parallel reads would only raise the peak.
+    for (const d of screened.files) {
+      try {
+        const bytes = await invoke("read_dropped_file", { id: d.id });
+        files.push(new File([bytes], d.name));
+      } catch (e) {
+        console.warn("[drop] could not read a dropped file:", e);
+        showDropError(t("upload.dropReadFailed", { name: d.name }));
+        return;
+      }
+    }
+    stageFiles({ ...screened, files });
+  }
+}
+
+// ─── App shell controls ───
+
+function wireAppShellControls() {
+  document.getElementById("appMenuBtn")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const app = document.querySelector(".app");
+    // In trash view: switch back to library.
+    if (document.querySelector(".sidebar.trash-view, .sidebar.favorites-view")) {
+      document.querySelector(".rail-library")?.click();
+    }
+    // If collapsed: open. Never collapse from the library button.
+    if (app?.classList.contains("cat-collapsed")) {
+      document.getElementById("catalogToggle")?.click();
+    }
+  });
+
+}
+
+// ─── Keyboard shortcuts ───
+
+document.addEventListener("keydown", (e) => {
+  if (!transport()) return;
+  // Ctrl, Cmd and Alt chords are the browser's, and a focused field or select
+  // keeps its keys: Space there used to play the song instead.
+  if (ignoredByShortcuts(e)) return;
+  if (e.code === "Space") {
+    e.preventDefault();
+    togglePlayPause();
+  } else if (e.code === "BracketLeft") {
+    e.preventDefault();
+    // setPlayheadTime clamps to [0, totalDuration] itself, so the Math.max /
+    // Math.min the multitrack version needed are gone with it.
+    setPlayheadTime(transport().getCurrentTime() - 5);
+  } else if (e.code === "BracketRight") {
+    e.preventDefault();
+    setPlayheadTime(transport().getCurrentTime() + 5);
+  } else if (e.code === "KeyL") {
+    e.preventDefault();
+    loopBtn.click();
+  } else if (e.code === "KeyK") {
+    e.preventDefault();
+    toggleMetronome();
+  } else if (e.code === "KeyI" && loopEnabled) {
+    e.preventDefault();
+    // multitrack.getCurrentTime() is pinned at 0 on the engine path, so "set
+    // loop in at playhead" always wrote 0 regardless of where the playhead was.
+    setLoopStart(Math.min(transport().getCurrentTime(), loopEnd - 0.5));
+    updateLoopRegionVisual();
+  } else if (e.code === "KeyO" && loopEnabled) {
+    e.preventDefault();
+    setLoopEnd(Math.max(transport().getCurrentTime(), loopStart + 0.5));
+    updateLoopRegionVisual();
+  } else if (shortcutIndex(e.code, e.key) >= 0 && seekToTagForKey(e, markerKeyState(e))) {
+    // 1 to 9 jump to the song's first nine markers (#1075). Plain digits, not
+    // Ctrl or Cmd with one: those switch the browser's tabs and a page cannot
+    // take them, and Alt is excluded above (Option types a symbol on a Mac,
+    // and Alt+digit switches tabs in Firefox on Linux). No other key in the
+    // app uses a digit. A digit with no marker is left alone, and so is every
+    // digit outside the studio view (tagShortcutIndex in timelineTags.js).
+    e.preventDefault();
+  }
+});
+
+/**
+ * What the marker keys need to know about the rest of the app, each read from
+ * the module that owns it. A dialog counts when it is modal and showing, or
+ * when the key was pressed inside one or inside a menu (the rule karaoke.js
+ * and streamer.js use for their own keys). A non-modal one that does not have
+ * the key, such as the floating video window, leaves the digits working.
+ */
+function markerKeyState(e) {
+  const inDialog = e.target instanceof Element && Boolean(e.target.closest("[role=dialog], [role=menu]"));
+  const modalOpen = [...document.querySelectorAll('[role=dialog][aria-modal="true"]')]
+    .some((el) => el.getClientRects().length > 0);
+  return {
+    karaokeOpen: isKaraokeOpen(),
+    streamerOpen: isStreamerOpen(),
+    dialogOpen: inDialog || modalOpen,
+    // helpMode.js marks the page with this class while the Guide is on, as
+    // modeUi.js reads it.
+    guideOpen: document.body.classList.contains("help-mode"),
+    recording: isRecording() || isStreamerTakeOpen(),
+    countIn: isCountInRunning(),
+  };
+}
+
+// ─── Drag audio out to a DAW or a folder ───
+//
+// Only the desktop app can do this: handing the OS a file needs a real path,
+// which no browser will produce. The gesture is cancelled here and the
+// platform drag is started in Rust (desktop/src-tauri/src/dragout.rs).
+
+const canDragOut = Boolean(window.__TAURI__?.core?.invoke);
+if (canDragOut) document.body.classList.add("can-drag-out");
+
+// The export panel's format, read from the DOM rather than its closure.
+// MP4 is a video mux that cannot be region-trimmed, so a drag is always audio.
+function exportFormat() {
+  const ext = document.querySelector(".export-fmt.active")?.id?.replace("t-fmt-", "") || "wav";
+  return ext === "mp4" ? "wav" : ext;
+}
+
+if (canDragOut) {
+  document.addEventListener("dragstart", (e) => {
+    const grip = e.target.closest("[data-loop-drag-out]");
+    const nugget = e.target.closest("[data-lane-drag-out]");
+    const lane = e.target.closest("a.lane-dl");
+    if (!grip && !nugget && !lane) return;
+
+    let payload = null;
+    if (grip) {
+      payload = regionDragPayload(exportFormat());
+    } else if (nugget) {
+      const stem = nugget.dataset.laneDragOut;
+      payload = stemRegionDragPayload(stem, exportFormat());
+      // The instrument, so what is in flight says which track it is. A miss
+      // falls back to the app icon in Rust rather than blocking the drag.
+      if (payload) payload.icon = laneDragIcon(stem);
+    } else if (lane.download && !lane.getAttribute("href").endsWith("#")) {
+      // The anchor already carries the song-prefixed filename the click path
+      // saves under, set in player.js, and an href the browser has made
+      // absolute. Reuse both rather than deriving a second copy of either.
+      // Placeholder rows for absent stems keep href="#".
+      payload = { url: lane.href, filename: lane.download };
+    }
+
+    // Always cancel: an HTML5 drag of a lane anchor would otherwise offer the
+    // page's own URL to the drop target, which is worse than doing nothing.
+    e.preventDefault();
+    if (!payload) return;
+    invokeDrag(payload);
+  });
+}
+
+// Render a lane's slice before it is grabbed.
+//
+// The mix is warmed on pointerup, but a lane's region is a different render
+// with its own cache key, and warming all six on every loop change would be
+// six ffmpeg runs for the one the user might want. Hovering a grip is the
+// cheapest honest signal of which that is, and it always precedes the grab.
+const warmedLanes = new Set();
+
+function warmLaneRegion(stem) {
+  const payload = stemRegionDragPayload(stem, exportFormat());
+  if (!payload || warmedLanes.has(payload.url)) return;
+  warmedLanes.add(payload.url);
+  // Range so this costs the render, which is the point, and not the transfer.
+  fetch(payload.url, { headers: { Range: "bytes=0-0" } }).catch(() => {
+    // Let it be retried; a failed warm just means the drag renders instead.
+    warmedLanes.delete(payload.url);
+  });
+}
+
+if (canDragOut) {
+  document.addEventListener(
+    "pointerover",
+    (e) => {
+      const stem = e.target.closest?.("[data-lane-drag-out]")?.dataset.laneDragOut;
+      if (stem) warmLaneRegion(stem);
+    },
+    true,
+  );
+}
+
+function refreshDragGrip(enabled) {
+  const grip = document.querySelector("[data-loop-drag-out]");
+  if (!grip) return;
+  grip.draggable = enabled;
+  grip.classList.toggle("disabled", !enabled);
+}
+
+function invokeDrag({ url, filename, icon = null }) {
+  const invoke = window.__TAURI__?.core?.invoke;
+  invoke?.("start_audio_drag", { url, filename, icon }).catch((err) => {
+    console.warn("[stemdeck] drag failed:", err);
+  });
+}
+
+// Render the region before it is grabbed.
+//
+// A platform drag must start while the button is still down, so the file
+// cannot be rendered during the gesture. Warming on pointerup covers both
+// moving the loop and moving a fader, since a gain change alters the mixdown
+// and so the cache key the drag will ask for.
+let prewarmTimer = null;
+let lastWarmed = "";
+if (canDragOut) {
+  document.addEventListener(
+    "pointerup",
+    () => {
+      clearTimeout(prewarmTimer);
+      prewarmTimer = setTimeout(() => {
+        const payload = regionDragPayload(exportFormat());
+        // Mute every lane and there is nothing to export. The menu says so;
+        // a drag has nowhere to say it, so the grip stops being draggable
+        // instead of starting a gesture that silently produces nothing.
+        // pointerup is the right moment: muting and soloing are both clicks.
+        refreshDragGrip(Boolean(payload));
+        if (!payload || payload.url === lastWarmed) return;
+        lastWarmed = payload.url;
+        prewarmRegionMix(exportFormat());
+      }, 500);
+    },
+    true,
+  );
+}
+
+// ─── External links ───
+
+// click covers the primary button, with or without Ctrl, Cmd or Shift. A
+// middle-click fires auxclick instead, which the webview would otherwise
+// answer with its own window (#1041). The decision is in externalLinks.js.
+function routeExternalLink(e) {
+  const invoke = window.__TAURI__?.core?.invoke;
+  const act = externalLinkAction({ type: e.type, button: e.button, target: e.target, hasShell: Boolean(invoke) });
+  if (!act) return;
+  e.preventDefault();
+  if (act.action === "save") invoke("save_audio_file", { url: act.url, filename: act.filename });
+  else if (act.action === "open") invoke("open_url", { url: act.url });
+}
+document.addEventListener("click", routeExternalLink);
+document.addEventListener("auxclick", routeExternalLink);
+
+// ─── Global error logging ───
+
+window.addEventListener("error", (e) => {
+  console.error("[app:error]", e.message, "\n", e.filename, ":", e.lineno, "\n", e.error?.stack ?? "");
+});
+window.addEventListener("unhandledrejection", (e) => {
+  console.error("[app:unhandledrejection]", e.reason?.message ?? e.reason, "\n", e.reason?.stack ?? "");
+});
+
+// ─── Bootstrap ───
+
+buildStripStems();

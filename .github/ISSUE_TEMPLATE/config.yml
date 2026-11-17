@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & Discussion
+    url: https://github.com/djtetal87/tetalstem/discussions
+    about: Ask questions, share setups, or discuss ideas with the community.
+  - name: Discord
+    url: https://discord.gg/YhCKsjhcwB
+    about: Chat with the TetalStem community in real time.
+  - name: Report a security vulnerability
+    url: https://github.com/djtetal87/tetalstem/security/advisories/new
+    about: Please report security issues privately, not as a public issue.

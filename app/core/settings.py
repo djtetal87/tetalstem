@@ -1,0 +1,887 @@
+"""Runtime, user-toggleable settings (persisted to disk).
+
+These are read live (unlike the env-var constants in config.py, which are fixed
+at startup), so the Settings UI can change them without a restart:
+
+- `allow_network`     — whether TetalStem answers requests from other devices.
+- `max_duration_sec`  — longest track accepted for processing.
+- `jobs_dir`          — where extracted stems are written (needs a restart).
+- `playlist_max_items` — how many tracks one playlist import may queue.
+- `video_max_height`  — max video resolution for MP4 export / YouTube pulls.
+- `export_sample_rate` — sample rate for exported mixes/regions (WAV/FLAC/MP3).
+- `demucs_device`     — compute device for separation: auto | cuda | mps | cpu.
+- `separation_quality` — demucs shift-averaging: standard | best (2x slower).
+- `idle_unload_minutes` - idle minutes before the separation models unload (0 never).
+- `cookies_file`      — optional cookies.txt handed to yt-dlp for YouTube.
+- `auto_delete_jobs`  — whether finished jobs are deleted after a while (off).
+- `auto_delete_days`  — how long they are kept when that is on.
+- `acoustid_api_key`  - the user's AcoustID key, for fingerprint identification.
+- `discogs_token`     - the user's Discogs token, for band profiles.
+- `transcribe_lyrics` - Whisper lyrics when none are found: auto | on | off.
+- `video_encoder`     - H.264 encoder of the take render: auto | cpu | an encoder.
+- `stem_format`       - how new songs' stems are stored: wav | mp3 (#783).
+- `stem_mp3_kbps`     - the MP3 bitrate when stem_format is mp3: 128 | 192 | 256.
+
+Defaults fall back to the config.py constants (which honor their env vars), so
+nothing changes until the user overrides a value.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import threading
+import time
+import uuid
+from pathlib import Path
+
+from app.core.config import (
+    DATA_DIR,
+    DEFAULT_STEM_STORAGE,
+    IDLE_UNLOAD_MINUTES,
+    IDLE_UNLOAD_MINUTES_MAX,
+    MAX_DURATION_SEC,
+    PLAYLIST_MAX_ITEMS,
+    STEM_FORMAT_CHOICES,
+    STEM_MP3_KBPS_CHOICES,
+    VIDEO_ENCODER_CHOICES,
+    VIDEO_MAX_HEIGHT,
+    available_torch_devices,
+    detect_torch_device,
+)
+
+_log = logging.getLogger("stemdeck.settings")
+
+_SETTINGS_PATH = DATA_DIR / "settings.json"
+_LOCK = threading.RLock()
+_state: dict | None = None  # whole settings dict, loaded lazily
+
+# Clamp bounds. Max track length is capped at 60 min (the product ceiling).
+_DURATION_MIN, _DURATION_MAX = 60, 3600  # 1 min .. 60 min
+# Published through /api/settings so the UI reads the ceiling rather than
+# keeping its own copy of it.
+DURATION_MIN_SEC, DURATION_MAX_SEC = _DURATION_MIN, _DURATION_MAX
+_HEIGHT_MIN, _HEIGHT_MAX = 144, 2160
+_PLAYLIST_MIN, _PLAYLIST_MAX = 1, 200
+_PORT_MIN, _PORT_MAX = 1024, 65535
+DEFAULT_PORT = 8000
+
+# Sample rates offered for mix/region export. 44.1 kHz (the Demucs stem rate, so
+# the default is a pass-through) covers most samplers and DAWs; the others cover
+# hardware that demands a specific rate (e.g. an Akai MPC rejecting 48 kHz).
+EXPORT_SAMPLE_RATES = (22050, 32000, 44100, 48000)
+DEFAULT_EXPORT_SAMPLE_RATE = 44100
+
+
+def _default_allow_network() -> bool:
+    # STEMDECK_ALLOW_NETWORK takes precedence when set explicitly.
+    # Otherwise: desktop keeps network off (user opts in via UI toggle);
+    # server/Docker deployments open it by default since network access is
+    # the entire point of a headless deployment.
+    env = os.environ.get("STEMDECK_ALLOW_NETWORK")
+    if env is not None:
+        return env.strip() == "1"
+    return os.environ.get("STEMDECK_DESKTOP") != "1"
+
+
+def _read_json_dict(path: Path) -> dict | None:
+    """Parse `path` as a JSON object.
+
+    None means "there is nothing usable here" -- absent, unreadable, not JSON,
+    or JSON that is not an object. Callers that need to tell *absent* from
+    *unusable* must check existence themselves; that distinction is the whole
+    point of _load below."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except Exception:
+        _log.warning("could not read settings from %s", path, exc_info=True)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def fsync_dir(directory: Path) -> None:
+    """Make a rename in `directory` durable. POSIX only: Windows cannot open a
+    directory for fsync, and NTFS journals the rename itself."""
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass  # some filesystems (network shares) refuse; the rename still happened
+    finally:
+        os.close(fd)
+
+
+def _atomic_write_json(path: Path, data: dict) -> bool:
+    """Write `data` to `path` so an interrupted write cannot destroy what was
+    there before.
+
+    write_text() truncates first and writes second, so a process that dies in
+    between leaves a file that exists and does not parse -- which _load then
+    could not distinguish from a first run, and the next setting change
+    persisted a one-key file over it (#509). Same
+    same-directory temp + replace the registry already uses; the temp name is
+    unique per call so two concurrent writers cannot interleave on it.
+
+    The bytes are on the disk before the rename, as in the registry: this file
+    holds jobs_dir, and a power cut that left it torn after a library move would
+    bring the app back to the folder the songs left."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(data))
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+        fsync_dir(path.parent)
+    except Exception:
+        _log.warning("could not persist settings to %s", path, exc_info=True)
+        return False
+    return True
+
+
+def quarantine_corrupt(path: Path, what: str = "settings") -> Path | None:
+    """Move an unusable file aside rather than leaving it to be overwritten by
+    the next save. Returns where it went, or None if it could not be moved.
+
+    Renaming keeps the bytes for diagnosis. Deleting or writing over them
+    destroys the only remaining evidence of what the user had configured.
+    Shared with the registry (app/core/registry.py), whose file has the same
+    problem; `what` only names the file in the log."""
+    try:
+        stamp = int(time.time())
+        target = path.with_name(f"{path.name}.corrupt-{stamp}")
+        n = 1
+        while target.exists():  # a second quarantine within the same second
+            target = path.with_name(f"{path.name}.corrupt-{stamp}-{n}")
+            n += 1
+        path.replace(target)
+        _log.warning("%s at %s were unreadable; moved aside to %s", what, path, target)
+        return target
+    except OSError:
+        _log.warning("could not move unreadable %s at %s aside", what, path, exc_info=True)
+        return None
+
+
+_quarantine_corrupt = quarantine_corrupt
+
+
+def _load() -> dict:
+    """Read settings, telling "no file yet" apart from "file we cannot read".
+
+    Conflating the two is what lost real user settings: a torn write left an
+    unparsable file, this returned {} exactly as it would on a first run, and
+    the next set_*() then persisted a single key over it."""
+    if not _SETTINGS_PATH.exists():
+        return {}  # no settings file yet — genuine first run; use defaults
+
+    data = _read_json_dict(_SETTINGS_PATH)
+    if data is not None:
+        return data
+
+    # The file is there but unusable. Preserve it for diagnosis.
+    _quarantine_corrupt(_SETTINGS_PATH)
+    return {}
+
+
+def _ensure() -> dict:
+    global _state
+    if _state is None:
+        _state = _load()
+    return _state
+
+
+def _save() -> bool:
+    """Write settings.json. Best-effort for most settings (read-only FS,
+    permissions: the in-memory value still applies for this session, so a
+    caller here does not fail its request over it) -- but the write outcome
+    is still reported back, because one caller (set_jobs_dir) is coupled to
+    something irreversible enough that silently swallowing a failure there
+    would be actively misleading rather than merely inconvenient (#403)."""
+    return _atomic_write_json(_SETTINGS_PATH, _ensure())
+
+
+def _num(v: object) -> int | None:
+    return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+# ── allow_network ──
+def get_allow_network() -> bool:
+    with _LOCK:
+        v = _ensure().get("allow_network")
+        return v if isinstance(v, bool) else _default_allow_network()
+
+
+def set_allow_network(value: bool) -> bool:
+    with _LOCK:
+        _ensure()["allow_network"] = bool(value)
+        _save()
+        return bool(value)
+
+
+# ── auto_delete_jobs / auto_delete_days ──
+#
+# Whether finished jobs are deleted after a while, and after how long.
+#
+# Off unless the user says otherwise, and that direction is the whole point.
+# Deleting a finished separation destroys work that cannot be recovered, so the
+# behaviour of an install nobody has configured has to be "keep it". It used to
+# be the reverse: the sweep ran unless an environment variable switched it off,
+# which meant every documented way of starting TetalStem set that variable and
+# anyone who started the backend directly silently lost their library within a
+# day (#459).
+#
+# The stored setting wins over the environment, unlike jobs_dir where the env
+# pin wins. A mounted volume is not the user's to relocate; how long their own
+# work is kept is exactly their call, and TetalStem is single-user with no
+# separate operator to protect.
+_AUTO_DELETE_DAYS_MIN, _AUTO_DELETE_DAYS_MAX = 1, 365
+AUTO_DELETE_DAYS_MIN, AUTO_DELETE_DAYS_MAX = _AUTO_DELETE_DAYS_MIN, _AUTO_DELETE_DAYS_MAX
+DEFAULT_AUTO_DELETE_DAYS = 30
+
+
+def _default_auto_delete_jobs() -> bool:
+    """Only an explicit STEMDECK_PERSIST_LIBRARY=0 asks for deletion.
+
+    The variable reads as "persist the library", so 0 means "do not", which is
+    the one env-based way left to opt in. Unset, malformed, or 1 all mean keep,
+    so a deployment that forgets it loses nothing.
+    """
+    return os.environ.get("STEMDECK_PERSIST_LIBRARY", "").strip() == "0"
+
+
+def get_auto_delete_jobs() -> bool:
+    with _LOCK:
+        v = _ensure().get("auto_delete_jobs")
+        return v if isinstance(v, bool) else _default_auto_delete_jobs()
+
+
+def set_auto_delete_jobs(value: bool) -> bool:
+    with _LOCK:
+        _ensure()["auto_delete_jobs"] = bool(value)
+        _save()
+        return bool(value)
+
+
+def _default_auto_sections() -> bool:
+    """Automatic song-structure detection, off until the user asks for it.
+
+    The stage costs a CPU inference pass per job and produces suggestions
+    rather than ground truth, so nobody should pay for it without having
+    chosen to. STEMDECK_AUTO_SECTIONS=1 turns it on for a deployment that
+    wants it from first boot.
+    """
+    return os.environ.get("STEMDECK_AUTO_SECTIONS", "").strip() == "1"
+
+
+def _default_auto_lyrics() -> bool:
+    """Lyrics found while a song is imported (LRCLIB, then a Whisper
+    transcript of the vocals), off until the user turns Detect lyrics on.
+
+    Unlike Detect structure this is a standing choice, kept until changed.
+    STEMDECK_AUTO_LYRICS=1 turns it on for a deployment that wants it from
+    first boot.
+    """
+    return os.environ.get("STEMDECK_AUTO_LYRICS", "").strip() == "1"
+
+
+def get_auto_lyrics() -> bool:
+    with _LOCK:
+        v = _ensure().get("auto_lyrics")
+        return v if isinstance(v, bool) else _default_auto_lyrics()
+
+
+def set_auto_lyrics(value: bool) -> bool:
+    with _LOCK:
+        _ensure()["auto_lyrics"] = bool(value)
+        _save()
+        return bool(value)
+
+
+def get_auto_sections() -> bool:
+    with _LOCK:
+        v = _ensure().get("auto_sections")
+        return v if isinstance(v, bool) else _default_auto_sections()
+
+
+def set_auto_sections(value: bool) -> bool:
+    with _LOCK:
+        _ensure()["auto_sections"] = bool(value)
+        _save()
+        return bool(value)
+
+
+def _default_auto_delete_days() -> int:
+    """Honour a STEMDECK_JOB_TTL_SECONDS somebody already tuned.
+
+    That knob predates this setting and is in seconds, so it is converted and
+    clamped. A TTL shorter than a day becomes one day rather than none: the
+    control is in days now, and rounding someone's one-hour sweep down to zero
+    would turn a deliberately aggressive setting into a much slower one.
+    """
+    raw = os.environ.get("STEMDECK_JOB_TTL_SECONDS", "").strip()
+    if raw:
+        try:
+            days = round(int(raw) / 86400) or _AUTO_DELETE_DAYS_MIN
+        except ValueError:
+            return DEFAULT_AUTO_DELETE_DAYS
+        return max(_AUTO_DELETE_DAYS_MIN, min(_AUTO_DELETE_DAYS_MAX, days))
+    return DEFAULT_AUTO_DELETE_DAYS
+
+
+def get_auto_delete_days() -> int:
+    with _LOCK:
+        v = _num(_ensure().get("auto_delete_days"))
+        if v is None:
+            return _default_auto_delete_days()
+        return max(_AUTO_DELETE_DAYS_MIN, min(_AUTO_DELETE_DAYS_MAX, v))
+
+
+def set_auto_delete_days(value: int) -> int:
+    clamped = max(_AUTO_DELETE_DAYS_MIN, min(_AUTO_DELETE_DAYS_MAX, int(value)))
+    with _LOCK:
+        _ensure()["auto_delete_days"] = clamped
+        _save()
+        return clamped
+
+
+# ── max_duration_sec ──
+def get_max_duration_sec() -> int:
+    with _LOCK:
+        v = _num(_ensure().get("max_duration_sec"))
+        return max(_DURATION_MIN, min(_DURATION_MAX, v)) if v is not None else MAX_DURATION_SEC
+
+
+def set_max_duration_sec(value: int) -> int:
+    with _LOCK:
+        clamped = max(_DURATION_MIN, min(_DURATION_MAX, int(value)))
+        _ensure()["max_duration_sec"] = clamped
+        _save()
+        return clamped
+
+
+# ── jobs_dir ──
+# Where extracted stems are written. Read by config.py at import time (straight
+# from settings.json, to avoid importing this module from there), so a change
+# only takes effect on the next start -- which is also when the move that goes
+# with it has finished. Absent means "wherever the default puts it".
+def get_jobs_dir() -> str | None:
+    with _LOCK:
+        value = _ensure().get("jobs_dir")
+        return value if isinstance(value, str) and value.strip() else None
+
+
+def set_jobs_dir(value: str | None) -> tuple[str | None, bool]:
+    """Persist the jobs folder choice. Returns (resolved_value, persisted).
+
+    Unlike every other setting in this module, a failed persist here is not a
+    minor inconvenience: this is called only after move_library() has already
+    physically relocated the user's library (POST /api/settings/stems-location
+    in app/main.py), so quietly keeping the in-memory value "for this session"
+    and reporting success would mean the app comes back to the OLD (now-empty)
+    folder on the very next restart, with the real data sitting at a location
+    nothing points at any more (#403). The caller must check `persisted` and
+    tell the user the truth rather than assume a 200 means the choice stuck."""
+    with _LOCK:
+        if value is None or not str(value).strip():
+            _ensure().pop("jobs_dir", None)
+            return None, _save()
+        resolved = str(Path(str(value)).expanduser().resolve())
+        _ensure()["jobs_dir"] = resolved
+        return resolved, _save()
+
+
+# ── cookies_file ──
+# Path to a Netscape-format cookies.txt handed to yt-dlp as `cookiefile`.
+#
+# This exists because YouTube's bot check ("Sign in to confirm you're not a
+# bot") has no other remedy: yt-dlp ships no PO token generator, so an IP that
+# YouTube has flagged cannot import anything without credentials (#432).
+#
+# Deliberately a file path and not `cookiesfrombrowser`: reading a live browser
+# profile means touching the user's logged-in session on disk, and yt-dlp can
+# only do it reliably while that browser is closed. Exporting a cookies.txt is
+# an explicit, revocable act the user controls.
+#
+# Empty by default, and that matters. Supplying cookies makes yt-dlp skip every
+# client that does not support them, which removes the unauthenticated fallback
+# clients that work for most people today. Turning this on when you do not need
+# it makes imports worse, not better.
+def get_cookies_file() -> str | None:
+    with _LOCK:
+        value = _ensure().get("cookies_file")
+        return value if isinstance(value, str) and value.strip() else None
+
+
+def set_cookies_file(value: str | None) -> str | None:
+    """Persist the cookies.txt path, or clear it when given empty/None.
+
+    Raises ValueError when the path does not point at a readable file, so the
+    Settings UI can say so immediately rather than the user discovering it as a
+    failed import an hour later.
+
+    Only a file inside the data folder is accepted, and a bare name is looked
+    up there. Anyone who can reach Settings (the LAN, with network access on)
+    could otherwise point yt-dlp at any file on the machine, and yt-dlp echoes
+    each line it cannot parse into the backend log. One error for outside,
+    missing and unreadable, so the answer says nothing about other paths. A
+    path saved before this rule keeps working until it is changed.
+    """
+    with _LOCK:
+        if value is None or not str(value).strip():
+            _ensure().pop("cookies_file", None)
+            _save()
+            return None
+        resolved = None
+        try:
+            # Checked by name before resolve() touches the disk: resolving a
+            # \\host\share path opens it, and Windows sends the user's NTLM
+            # hash to that host. Checked again after, for a symlink out.
+            named = Path(os.path.normpath(DATA_DIR / Path(str(value)).expanduser()))
+            if named.is_relative_to(DATA_DIR):
+                candidate = named.resolve()
+                if candidate.is_relative_to(DATA_DIR.resolve()) and candidate.is_file():
+                    with candidate.open("rb") as fh:
+                        fh.read(1)
+                    resolved = candidate
+        except (OSError, ValueError, RuntimeError):
+            # A NUL byte, a bad Windows name or a symlink loop: the same answer.
+            resolved = None
+        if resolved is None:
+            raise ValueError("cookies file must be a readable file in the data folder")
+        _ensure()["cookies_file"] = str(resolved)
+        _save()
+        return str(resolved)
+
+
+# ── playlist_max_items ──
+# How many tracks one playlist import may queue. A waiting link costs a registry
+# record, so the ceiling is generous; the real reason to keep this adjustable is
+# that "import 200 tracks" is a decision about the user's evening, not about
+# resources.
+def get_playlist_max_items() -> int:
+    with _LOCK:
+        v = _num(_ensure().get("playlist_max_items"))
+        return max(_PLAYLIST_MIN, min(_PLAYLIST_MAX, v)) if v is not None else PLAYLIST_MAX_ITEMS
+
+
+def set_playlist_max_items(value: int) -> int:
+    with _LOCK:
+        clamped = max(_PLAYLIST_MIN, min(_PLAYLIST_MAX, int(value)))
+        _ensure()["playlist_max_items"] = clamped
+        _save()
+        return clamped
+
+
+# ── video_max_height ──
+def get_video_max_height() -> int:
+    with _LOCK:
+        v = _num(_ensure().get("video_max_height"))
+        return max(_HEIGHT_MIN, min(_HEIGHT_MAX, v)) if v is not None else VIDEO_MAX_HEIGHT
+
+
+def set_video_max_height(value: int) -> int:
+    with _LOCK:
+        clamped = max(_HEIGHT_MIN, min(_HEIGHT_MAX, int(value)))
+        _ensure()["video_max_height"] = clamped
+        _save()
+        return clamped
+
+
+# ── port ──
+# The preferred port the server binds on launch. The desktop launcher reads this
+# (default 8000) before spawning the backend; a self-hosted server's --port wins.
+# Changing it needs a restart — the socket is bound at startup.
+def get_port() -> int:
+    with _LOCK:
+        v = _num(_ensure().get("port"))
+        return max(_PORT_MIN, min(_PORT_MAX, v)) if v is not None else DEFAULT_PORT
+
+
+def set_port(value: int) -> int:
+    with _LOCK:
+        clamped = max(_PORT_MIN, min(_PORT_MAX, int(value)))
+        _ensure()["port"] = clamped
+        _save()
+        return clamped
+
+
+# ── export_sample_rate ──
+# Sample rate (Hz) the mix/region export encodes at. Read live per request by the
+# mixdown endpoint (app/api/stems.py), so a change applies to the next export
+# without a restart. Restricted to a small allowlist rather than clamped: an
+# arbitrary rate is more likely a mistake than an intent, and hardware samplers
+# only accept specific rates.
+def get_export_sample_rate() -> int:
+    with _LOCK:
+        v = _num(_ensure().get("export_sample_rate"))
+        return v if v in EXPORT_SAMPLE_RATES else DEFAULT_EXPORT_SAMPLE_RATE
+
+
+def set_export_sample_rate(value: int) -> int:
+    """Persist an export sample rate. Rejects anything outside the allowlist with
+    ValueError (surfaced as a 422) rather than clamping to the nearest rate."""
+    try:
+        rate = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("export_sample_rate must be an integer") from None
+    if rate not in EXPORT_SAMPLE_RATES:
+        raise ValueError(
+            "export_sample_rate must be one of: " + ", ".join(map(str, EXPORT_SAMPLE_RATES))
+        )
+    with _LOCK:
+        _ensure()["export_sample_rate"] = rate
+        _save()
+        return rate
+
+
+# ── demucs_device ──
+# Compute device for stem separation. "auto" (default) resolves to the best
+# available device via a hardware probe at job time; "cuda"/"mps"/"cpu" force
+# it. Read live per job (app/pipeline/separate.py), so changes apply to the
+# NEXT separation without a restart. STEMDECK_DEMUCS_DEVICE seeds the default
+# so existing env-based deployments keep their forced device.
+_DEVICE_CHOICES = ("auto", "cuda", "mps", "cpu")
+
+
+def _default_demucs_device() -> str:
+    env = os.environ.get("STEMDECK_DEMUCS_DEVICE", "").strip().lower()
+    return env if env in ("cuda", "mps", "cpu") else "auto"
+
+
+def get_demucs_device_choice() -> str:
+    """The persisted user choice ("auto" | "cuda" | "mps" | "cpu") -- what the
+    Settings UI displays, as opposed to what jobs run on (see below)."""
+    with _LOCK:
+        v = _ensure().get("demucs_device")
+        return v if isinstance(v, str) and v in _DEVICE_CHOICES else _default_demucs_device()
+
+
+def get_demucs_device() -> str:
+    """The device the next separation job will actually use: the forced choice,
+    or a fresh hardware probe when the choice is "auto"."""
+    choice = get_demucs_device_choice()
+    return detect_torch_device() if choice == "auto" else choice
+
+
+def set_demucs_device(value: str) -> str:
+    """Persist a device choice. Forcing "cuda"/"mps" verifies the device is
+    actually available first and raises ValueError if not -- rejecting the
+    write loudly beats persisting a device that would silently fall back or
+    crash the next job (the #247 lesson, applied to the server path)."""
+    choice = (value or "").strip().lower()
+    if choice not in _DEVICE_CHOICES:
+        raise ValueError("demucs_device must be one of: " + ", ".join(_DEVICE_CHOICES))
+    if choice in ("cuda", "mps") and choice not in available_torch_devices():
+        raise ValueError(f"{choice} is not available on this machine")
+    with _LOCK:
+        _ensure()["demucs_device"] = choice
+        _save()
+        return choice
+
+
+# ── separation_quality ──
+# "standard" (default) runs demucs once. "best" adds --shifts 2: demucs
+# re-runs separation on a randomly time-shifted copy of the input and
+# averages the two -- measurably cleaner stems, at ~2x the separation time.
+# Applies on any device; a CPU user who picks "best" is accepting the wait
+# knowingly. STEMDECK_SEPARATION_QUALITY seeds the default so existing
+# env-based deployments can force it.
+_QUALITY_CHOICES = ("standard", "best", "ultra")
+
+
+def _default_separation_quality() -> str:
+    env = os.environ.get("STEMDECK_SEPARATION_QUALITY", "").strip().lower()
+    return env if env in _QUALITY_CHOICES else "standard"
+
+
+def get_separation_quality() -> str:
+    with _LOCK:
+        v = _ensure().get("separation_quality")
+        return v if isinstance(v, str) and v in _QUALITY_CHOICES else _default_separation_quality()
+
+
+def set_separation_quality(value: str) -> str:
+    choice = (value or "").strip().lower()
+    if choice not in _QUALITY_CHOICES:
+        raise ValueError("separation_quality must be one of: " + ", ".join(_QUALITY_CHOICES))
+    with _LOCK:
+        _ensure()["separation_quality"] = choice
+        _save()
+        return choice
+
+
+# ── idle_unload_minutes ──
+# Minutes with no separation or analysis running before the separation worker
+# and the beat model are unloaded (#975), 0 for never. Read on every check of the idle timer
+# (app/pipeline/idle_unload.py), so a change applies without a restart.
+# STEMDECK_IDLE_UNLOAD_MINUTES seeds the default; a value saved here wins.
+def get_idle_unload_minutes() -> int:
+    with _LOCK:
+        v = _num(_ensure().get("idle_unload_minutes"))
+        if v is None:
+            return IDLE_UNLOAD_MINUTES
+        return max(0, min(IDLE_UNLOAD_MINUTES_MAX, v))
+
+
+def set_idle_unload_minutes(value: int) -> int:
+    clamped = max(0, min(IDLE_UNLOAD_MINUTES_MAX, int(value)))
+    with _LOCK:
+        _ensure()["idle_unload_minutes"] = clamped
+        _save()
+        return clamped
+
+
+# ── stem_format / stem_mp3_kbps ──
+# How a song's stems are stored once it finishes (#783): "wav" or "mp3" at a
+# CBR bitrate. Read when a job finishes (app/pipeline/stem_storage.py), so a
+# change applies to the next song without a restart; songs already in the
+# library keep whatever they were stored as. STEMDECK_STEM_FORMAT and
+# STEMDECK_STEM_MP3_KBPS seed the defaults for Docker and Unraid; a choice
+# saved in Settings wins over them, as for separation_quality.
+def _default_stem_format() -> str:
+    env = os.environ.get("STEMDECK_STEM_FORMAT", "").strip().lower()
+    return env if env in STEM_FORMAT_CHOICES else DEFAULT_STEM_STORAGE[0]
+
+
+def _default_stem_mp3_kbps() -> int:
+    raw = os.environ.get("STEMDECK_STEM_MP3_KBPS", "").strip().lower().removesuffix("k")
+    try:
+        kbps = int(raw)
+    except ValueError:
+        return DEFAULT_STEM_STORAGE[1]
+    return kbps if kbps in STEM_MP3_KBPS_CHOICES else DEFAULT_STEM_STORAGE[1]
+
+
+def get_stem_format() -> str:
+    with _LOCK:
+        v = _ensure().get("stem_format")
+        return v if isinstance(v, str) and v in STEM_FORMAT_CHOICES else _default_stem_format()
+
+
+def get_stem_mp3_kbps() -> int:
+    with _LOCK:
+        v = _ensure().get("stem_mp3_kbps")
+        ok = isinstance(v, int) and not isinstance(v, bool) and v in STEM_MP3_KBPS_CHOICES
+        return v if ok else _default_stem_mp3_kbps()
+
+
+def check_stem_format(value: object) -> str:
+    """The whitelisted format for ``value``, or ValueError (never echoing it)."""
+    choice = value.strip().lower() if isinstance(value, str) else ""
+    if choice not in STEM_FORMAT_CHOICES:
+        raise ValueError("stem_format must be one of: " + ", ".join(STEM_FORMAT_CHOICES))
+    return STEM_FORMAT_CHOICES[STEM_FORMAT_CHOICES.index(choice)]
+
+
+def check_stem_mp3_kbps(value: object) -> int:
+    """The whitelisted bitrate for ``value``, or ValueError (never echoing it)."""
+    kbps = value if isinstance(value, int) and not isinstance(value, bool) else None
+    if kbps not in STEM_MP3_KBPS_CHOICES:
+        raise ValueError(
+            "stem_mp3_kbps must be one of: " + ", ".join(map(str, STEM_MP3_KBPS_CHOICES))
+        )
+    return kbps
+
+
+def set_stem_storage(fmt: object = None, kbps: object = None) -> tuple[str, int]:
+    """Persist either or both, after both are validated: a request with one
+    bad value changes nothing. Returns what now applies."""
+    choice = check_stem_format(fmt) if fmt is not None else None
+    rate = check_stem_mp3_kbps(kbps) if kbps is not None else None
+    with _LOCK:
+        if choice is not None:
+            _ensure()["stem_format"] = choice
+        if rate is not None:
+            _ensure()["stem_mp3_kbps"] = rate
+        if choice is not None or rate is not None:
+            _save()
+        return get_stem_format(), get_stem_mp3_kbps()
+
+
+# ── video_encoder ──
+# The H.264 encoder of the take render (app/pipeline/video_encoder.py): "auto"
+# (default) uses NVENC on Windows when it passes a real test encode here, else
+# libx264, "cpu" always libx264, an encoder name only that one (libx264 when it fails).
+# Read per render. STEMDECK_VIDEO_ENCODER overrides it (video_encoder.policy).
+def get_video_encoder() -> str:
+    with _LOCK:
+        v = _ensure().get("video_encoder")
+        return v if isinstance(v, str) and v in VIDEO_ENCODER_CHOICES else "auto"
+
+
+def set_video_encoder(value: str) -> str:
+    choice = (value or "").strip().lower()
+    if choice not in VIDEO_ENCODER_CHOICES:
+        raise ValueError("video_encoder must be one of: " + ", ".join(VIDEO_ENCODER_CHOICES))
+    # The stored value is the whitelist's own string, never the request's.
+    choice = VIDEO_ENCODER_CHOICES[VIDEO_ENCODER_CHOICES.index(choice)]
+    with _LOCK:
+        _ensure()["video_encoder"] = choice
+        _save()
+        return choice
+
+
+# ── transcribe_lyrics ──
+# Whether a job with no lyrics found gets them transcribed from its vocals stem
+# with Whisper (app/pipeline/transcribe.py). "auto" (default) does it when the
+# job was separated on a cuda GPU only: NVIDIA, or AMD under a ROCm build of
+# torch, which serves it as cuda too (#825). Anywhere else, Apple's MPS
+# included, Whisper runs on the CPU, about 200 s a song rather than 30 s, so
+# "auto" leaves it off; "on" and "off" force it. Read per job, so
+# a change applies to the next import. STEMDECK_TRANSCRIBE_LYRICS seeds the
+# default for env-based deployments.
+_TRANSCRIBE_CHOICES = ("auto", "on", "off")
+
+
+def _default_transcribe_lyrics() -> str:
+    env = os.environ.get("STEMDECK_TRANSCRIBE_LYRICS", "").strip().lower()
+    return env if env in _TRANSCRIBE_CHOICES else "auto"
+
+
+def get_transcribe_lyrics() -> str:
+    with _LOCK:
+        v = _ensure().get("transcribe_lyrics")
+        return (
+            v if isinstance(v, str) and v in _TRANSCRIBE_CHOICES else _default_transcribe_lyrics()
+        )
+
+
+def set_transcribe_lyrics(value: str) -> str:
+    choice = (value or "").strip().lower()
+    if choice not in _TRANSCRIBE_CHOICES:
+        raise ValueError("transcribe_lyrics must be one of: " + ", ".join(_TRANSCRIBE_CHOICES))
+    with _LOCK:
+        _ensure()["transcribe_lyrics"] = choice
+        _save()
+        return choice
+
+
+def transcribe_lyrics_enabled(device: str | None) -> bool:
+    """Whether a job separated on ``device`` gets its lyrics transcribed.
+
+    ``device`` is the job's compute_device, so a GPU job that fell back to the
+    CPU ("cpu (fallback from cuda)") counts as a CPU one under "auto": the GPU
+    has just failed, and a CPU pass is the slow case "auto" exists to avoid.
+    """
+    choice = get_transcribe_lyrics()
+    if choice == "auto":
+        return device == "cuda"
+    return choice == "on"
+
+
+def lyrics_mending_enabled() -> bool:
+    """Whether found lyrics that lost their accents may be mended from the
+    vocals (transcribe.mend_lyrics), on any device unless the setting is "off".
+
+    Unlike a transcription, "auto" does not keep this to CUDA: its gates hold
+    it to the rare song whose lyrics are missing letters, which otherwise
+    shows broken words on every CPU and Mac install."""
+    return get_transcribe_lyrics() != "off"
+
+
+# ── acoustid_api_key ──
+# The user's own AcoustID application key, for identifying a track by its
+# audio fingerprint (app/pipeline/identify.py). Entered in Settings and never
+# shipped: AcoustID keys are per application and free to register. Without
+# one, nothing is fingerprinted and identification falls back to searching
+# MusicBrainz by the tags.
+#
+# A secret in the sense that it is the user's: never logged, and never handed
+# back by the API. /api/settings publishes only whether one is set and its
+# last two characters, so the field can show which key it holds. Real keys
+# are about ten characters, so two is a hint and not a useful part of one.
+_ACOUSTID_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+ACOUSTID_KEY_HINT_CHARS = 2
+
+
+def acoustid_key_format_ok(key: str) -> bool:
+    """Whether ``key`` has the shape of an AcoustID key at all."""
+    return bool(_ACOUSTID_KEY_RE.match(key))
+
+
+def get_acoustid_api_key() -> str | None:
+    with _LOCK:
+        value = _ensure().get("acoustid_api_key")
+        return value if isinstance(value, str) and _ACOUSTID_KEY_RE.match(value) else None
+
+
+def set_acoustid_api_key(value: str | None) -> str | None:
+    """Persist the key, or clear it when given empty/None. Raises ValueError,
+    without the value in the message, when it cannot be an AcoustID key."""
+    with _LOCK:
+        if value is None or not str(value).strip():
+            _ensure().pop("acoustid_api_key", None)
+            _save()
+            return None
+        key = str(value).strip()
+        if not _ACOUSTID_KEY_RE.match(key):
+            raise ValueError("acoustid_api_key must be 8 to 64 letters, digits, - or _")
+        _ensure()["acoustid_api_key"] = key
+        _save()
+        return key
+
+
+def acoustid_api_key_hint() -> str | None:
+    """The last two characters of the key, for the Settings field, or None."""
+    key = get_acoustid_api_key()
+    return key[-ACOUSTID_KEY_HINT_CHARS:] if key else None
+
+
+# ── discogs_token ──
+# The user's own Discogs personal access token, for band profiles, members and
+# releases of bands Wikipedia has no article on. Entered in Settings and never
+# shipped: Discogs tokens are per user and free. Without one, Discogs is never
+# asked.
+#
+# A secret as the AcoustID key is: never logged, never put in a URL, and never
+# handed back by the API, which publishes only whether one is set and its last
+# two characters. Discogs tokens are 40 letters and digits; the range is kept
+# loose so a change in their length does not lock anyone out.
+_DISCOGS_TOKEN_RE = re.compile(r"^[A-Za-z0-9]{20,80}$")
+DISCOGS_TOKEN_HINT_CHARS = 2
+
+
+def discogs_token_format_ok(token: str) -> bool:
+    """Whether ``token`` has the shape of a Discogs personal access token."""
+    return bool(_DISCOGS_TOKEN_RE.match(token))
+
+
+def get_discogs_token() -> str | None:
+    with _LOCK:
+        value = _ensure().get("discogs_token")
+        return value if isinstance(value, str) and _DISCOGS_TOKEN_RE.match(value) else None
+
+
+def set_discogs_token(value: str | None) -> str | None:
+    """Persist the token, or clear it when given empty/None. Raises ValueError,
+    without the value in the message, when it cannot be a Discogs token."""
+    with _LOCK:
+        if value is None or not str(value).strip():
+            _ensure().pop("discogs_token", None)
+            _save()
+            return None
+        token = str(value).strip()
+        if not _DISCOGS_TOKEN_RE.match(token):
+            raise ValueError("discogs_token must be 20 to 80 letters or digits")
+        _ensure()["discogs_token"] = token
+        _save()
+        return token
+
+
+def discogs_token_hint() -> str | None:
+    """The last two characters of the token, for the Settings field, or None."""
+    token = get_discogs_token()
+    return token[-DISCOGS_TOKEN_HINT_CHARS:] if token else None

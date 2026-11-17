@@ -1,0 +1,92 @@
+name: TetalStem macOS (M1 + Intel)
+
+# Push a tag like v1.0.0 (or run it by hand with a tag) to build both DMGs
+# and their runtime packs into the GitHub release for that tag. The app
+# downloads its runtime pack from that release on first launch.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, e.g. v1.0.0"
+        required: true
+        default: "v1.0.0"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.t.outputs.tag }}
+    steps:
+      - id: t
+        run: echo "tag=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+      - name: create release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.t.outputs.tag }}
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "TetalStem $TAG" \
+            --notes "TetalStem para Mac. Descarga **TetalStem-macOS-arm64.dmg** para Mac M1/M2/M3/M4 o **TetalStem-macOS-x64.dmg** para Mac Intel. Los archivos *runtime* los descarga la app sola la primera vez."
+
+  build:
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+            py: cpython-3.12-macos-aarch64-none
+            rust_target: aarch64-apple-darwin
+          - arch: x64
+            runner: macos-15-intel
+            py: cpython-3.12-macos-x86_64-none
+            rust_target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    env:
+      TAG: ${{ needs.release.outputs.tag }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: tools
+        run: |
+          brew install zstd uv || true
+          rustup default stable
+          rustup target add ${{ matrix.rust_target }}
+          uv python install ${{ matrix.py }}
+          echo "PYBIN=$(uv python find ${{ matrix.py }})" >> "$GITHUB_ENV"
+          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+      - name: version files
+        run: |
+          printf '{ "version": "%s" }\n' "$VERSION" > static/version.json
+      - name: runtime pack
+        env:
+          SSL_CERT_FILE: /etc/ssl/cert.pem
+          REQUESTS_CA_BUNDLE: /etc/ssl/cert.pem
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ env.VERSION }}
+        run: ARCH=${{ matrix.arch }} VERSION="$VERSION" PYTHON_BIN="$PYBIN" scripts/macos/make-runtime-pack.sh
+      - name: app
+        run: ARCH=${{ matrix.arch }} VERSION="$VERSION" scripts/macos/make-app.sh
+      - name: dmg
+        run: ARCH=${{ matrix.arch }} VERSION="$VERSION" scripts/macos/make-dmg.sh
+      - name: upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la .build .build/macos-dist
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            .build/macos-dist/TetalStem-macOS-${{ matrix.arch }}.dmg \
+            .build/TetalStem-runtime-macOS-${{ matrix.arch }}.tar.* \
+            .build/macos-dist/SHA256SUMS-macOS-${{ matrix.arch }}.txt

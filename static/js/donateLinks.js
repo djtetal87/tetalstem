@@ -49,8 +49,8 @@
 // in their own browser.
 
 export const DONATE_LINKS = Object.freeze({
-  stripe: "https://donate.stripe.com/4gM4gB3L5d325xebEG8g000",
-  liberapay: "https://liberapay.com/TetalStem/donate",
+  stripe: "",
+  liberapay: "",
 });
 
 export const DONATE_LINK_TEMPLATES = Object.freeze({
@@ -64,8 +64,8 @@ export const DONATE_QR = Object.freeze({
 });
 
 export const SOCIAL_LINKS = Object.freeze({
-  instagram: "https://www.instagram.com/stemdeck/",
-  x: "https://x.com/TetalStemApp",
+  instagram: "",
+  x: "",
 });
 
 /** The address a link opens, or null while it is a placeholder. Only https. */

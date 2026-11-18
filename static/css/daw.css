@@ -6285,3 +6285,4 @@ html:not(.mode-daw) #master-drawer {
 
 /* TetalStem: uso personal, sin donaciones */
 #donateBtn, #donateDialog, #donateStar, .rail-donate { display: none !important; }
+#friendsBtn, .rail-recommend, #friendsDialog { display: none !important; }

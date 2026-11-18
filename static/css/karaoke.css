@@ -591,3 +591,8 @@ html.karaoke-open .daw-footer { display: none !important; }
 @media (prefers-reduced-motion: reduce) {
   .kk-w, .kk-knob, .kk-fs-top, .kk-fs-bottom { transition: none; }
 }
+
+/* TetalStem: karaoke → video button */
+.kk-video-btn { width: auto !important; padding: 0 12px !important; gap: 6px; display: inline-flex; align-items: center; }
+.kk-video-label { font-size: 13px; font-weight: 600; }
+.kk-video-btn:disabled { opacity: .6; cursor: progress; }

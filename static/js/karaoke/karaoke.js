@@ -30,6 +30,7 @@ import { isRecording } from "../capture/recordUi.js";
 import { layoutState, changeLayout, requestSplit, onLayoutChange } from "../modeStems.js";
 import { splitFailedText, vocalSplitUnavailable, vocalSplitUnavailableText, onVocalSplitAvailability } from "../vocalSplitState.js";
 import { takeOpen as streamerTakeOpen } from "../streamer/streamerRecord.js";
+import { triggerDownload } from "../player.js";
 import {
   transposedKey, semitoneLabel, clockShort, clockLong,
   sungLines, lyricFrame, timedWords, karaokeStems, karaokeMutedByDefault, karaokeAlwaysOn,
@@ -98,6 +99,7 @@ function icon(paths, { size = 20, fill = "none", stroke = "currentColor", width 
 
 const ICONS = {
   fullscreen: ["M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"],
+  video: ["M3 6h12v12H3z", "M15 10l6-3v10l-6-3"],
   exitFullscreen: ["M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"],
   minus: ["M5 12h14"],
   plus: ["M5 12h14M12 5v14"],
@@ -224,7 +226,14 @@ function buildWindowed() {
   const fsBtn = button("kk-icon-btn kk-fs-btn", t("karaoke.fullscreenEnter"));
   fsBtn.append(icon(ICONS.fullscreen));
   fsBtn.addEventListener("click", () => enterFullscreen());
-  head.append(art.box, titles, fsBtn);
+  // TetalStem: download this karaoke as an MP4 video.
+  const videoBtn = button("kk-icon-btn kk-video-btn", "Descargar video karaoke");
+  videoBtn.title = "Descargar como video (MP4)";
+  videoBtn.append(icon(ICONS.video));
+  const videoLabel = el("span", "kk-video-label", "Video");
+  videoBtn.append(videoLabel);
+  videoBtn.addEventListener("click", () => exportKaraokeVideo(videoBtn, videoLabel));
+  head.append(art.box, titles, videoBtn, fsBtn);
   const lyrics = buildLyrics("window");
   const progress = buildProgress();
   inner.append(head, lyrics.wrap, progress.wrap);
@@ -594,6 +603,59 @@ function enforceVoiceOff() {
     refreshMixerVisuals();
     applyMix();
     persistMix();
+  }
+}
+
+// ── TetalStem: export to video ──
+
+let exporting = false;
+
+async function exportKaraokeVideo(btn, label) {
+  if (exporting) return;
+  const job = currentJobId;
+  if (!job) {
+    flashNote("Abre una canción primero.");
+    return;
+  }
+  const stems = [...presentLanes()].filter((n) => !mixerState[n]?.muted);
+  if (!stems.length) {
+    flashNote("No hay ninguna pista encendida para el video.");
+    return;
+  }
+  const meta = trackMeta();
+  const safe = (meta.title || "karaoke").replace(/[\\/:*?"<>|]+/g, " ").trim().slice(0, 80) || "karaoke";
+  const body = {
+    stems,
+    lines: lyr.lines.map((l) => ({ time: l.time, text: l.text })),
+    words: lyr.words.map((ws) => (ws || []).map((w) => ({ text: w.text, start: w.start }))),
+    title: meta.title,
+    artist: meta.artist,
+    semitones: Math.round(Number(getGlobalPitch()?.semitones) || 0),
+  };
+  const makeUrl = async () => {
+    const r = await fetch(`/api/jobs/${job}/karaoke-video`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(`karaoke video failed (${r.status})`);
+    return (await r.json()).url;
+  };
+  exporting = true;
+  btn.disabled = true;
+  const prev = label.textContent;
+  try {
+    const ok = await triggerDownload(makeUrl, `${safe} (karaoke).mp4`, () => {
+      label.textContent = "Creando…";
+    });
+    if (ok) flashNote("Video karaoke guardado ✔");
+  } catch (err) {
+    console.warn("[karaoke] video export failed:", err);
+    flashNote("No se pudo crear el video.");
+  } finally {
+    exporting = false;
+    btn.disabled = false;
+    label.textContent = prev;
   }
 }
 

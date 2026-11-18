@@ -2597,3 +2597,66 @@ def delete_job(job_id: str, response: Response) -> dict[str, str]:
             detail="Removed from the library, but its files could not be deleted.",
         )
     return {"job_id": job_id, "status": "deleted"}
+
+
+# ── TetalStem: Karaoke → video ──
+
+_KARAOKE_STEM_RE = re.compile(r"^[a-z_]{1,32}$")
+_karaoke_video_lock = threading.Lock()
+
+
+@router.post("/{job_id}/karaoke-video")
+async def render_karaoke_video(job_id: str, request: Request) -> dict[str, str]:
+    """Render what Karaoke shows (lyrics with per-word highlight over the
+    stems that are on) to an MP4, then return the URL to fetch it from."""
+    if not JOB_ID_RE.match(job_id):
+        raise HTTPException(status_code=404, detail="job not found")
+    job = registry_get(job_id)
+    if job is None or job.status != "done":
+        raise HTTPException(status_code=404, detail="job not found")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    stems = [s for s in (body.get("stems") or []) if isinstance(s, str) and _KARAOKE_STEM_RE.match(s)]
+    if not stems:
+        raise HTTPException(status_code=422, detail="no stems selected")
+    lines = body.get("lines") if isinstance(body.get("lines"), list) else []
+    words = body.get("words") if isinstance(body.get("words"), list) else []
+    title = str(body.get("title") or getattr(job, "title", "") or "Karaoke")[:120]
+    artist = str(body.get("artist") or "")[:120]
+    try:
+        semitones = max(-12, min(12, int(body.get("semitones") or 0)))
+    except (TypeError, ValueError):
+        semitones = 0
+    job_dir = (JOBS_DIR / job_id).resolve()
+    if not job_dir.is_relative_to(JOBS_DIR.resolve()):
+        raise HTTPException(status_code=404, detail="job not found")
+    out = job_dir / "exports" / "karaoke.mp4"
+
+    from app.pipeline.karaoke_video import KaraokeVideoError, render
+
+    def _run() -> None:
+        with _karaoke_video_lock:
+            render(job_dir / "stems", stems, lines[:2000], words[:2000], title, artist, out, semitones)
+
+    try:
+        await asyncio.to_thread(_run)
+    except KaraokeVideoError as exc:
+        logger.warning("[%s] karaoke video failed: %s", job_id, exc)
+        raise HTTPException(status_code=500, detail="karaoke video failed") from None
+    return {"url": f"/api/jobs/{job_id}/karaoke-video/file?v={int(time.time())}"}
+
+
+@router.get("/{job_id}/karaoke-video/file")
+async def get_karaoke_video(job_id: str) -> Response:
+    from fastapi.responses import FileResponse
+
+    if not JOB_ID_RE.match(job_id):
+        raise HTTPException(status_code=404, detail="not found")
+    path = (JOBS_DIR / job_id / "exports" / "karaoke.mp4").resolve()
+    if not path.is_relative_to(JOBS_DIR.resolve()) or not path.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(path, media_type="video/mp4", filename="karaoke.mp4")

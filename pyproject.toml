@@ -33,6 +33,8 @@ dependencies = [
     # Without this, demucs crashes on save with "Couldn't find appropriate
     # backend to handle uri ... drums.wav".
     "soundfile>=0.12",
+    # TetalStem: karaoke video frames.
+    "pillow>=10",
     # BPM + key analysis on the downloaded source. Pulls numpy/scipy/numba.
     # librosa 1.0.0 dropped its audioread dependency; audio-separator (below)
     # still imports audioread directly, so an unpinned upper bound lets a

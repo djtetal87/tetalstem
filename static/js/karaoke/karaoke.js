@@ -632,14 +632,32 @@ async function exportKaraokeVideo(btn, label) {
     artist: meta.artist,
     semitones: Math.round(Number(getGlobalPitch()?.semitones) || 0),
   };
+  let lastError = "";
   const makeUrl = async () => {
     const r = await fetch(`/api/jobs/${job}/karaoke-video`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    if (!r.ok) throw new Error(`karaoke video failed (${r.status})`);
-    return (await r.json()).url;
+    if (!r.ok && r.status !== 202) {
+      let d = "";
+      try { d = (await r.json()).detail || ""; } catch { /* not JSON */ }
+      lastError = `HTTP ${r.status} ${d}`;
+      throw new Error(lastError);
+    }
+    // Rendered in the background: poll until it is ready.
+    for (;;) {
+      await new Promise((res) => setTimeout(res, 1500));
+      const s = await fetch(`/api/jobs/${job}/karaoke-video/status`, { cache: "no-store" });
+      if (!s.ok) continue;
+      const st = await s.json();
+      if (st.stage) label.textContent = st.stage.replace(/\.\.\.$/, "…");
+      if (st.state === "done" && st.url) return st.url;
+      if (st.state === "error" || st.state === "none") {
+        lastError = st.error || "el render se detuvo";
+        throw new Error(lastError);
+      }
+    }
   };
   exporting = true;
   btn.disabled = true;
@@ -651,7 +669,8 @@ async function exportKaraokeVideo(btn, label) {
     if (ok) flashNote("Video karaoke guardado ✔");
   } catch (err) {
     console.warn("[karaoke] video export failed:", err);
-    flashNote("No se pudo crear el video.");
+    const why = String(lastError || err?.message || err || "").slice(0, 220);
+    flashNote(`No se pudo crear el video: ${why}`);
   } finally {
     exporting = false;
     btn.disabled = false;

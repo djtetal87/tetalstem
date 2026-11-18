@@ -2603,16 +2603,19 @@ def delete_job(job_id: str, response: Response) -> dict[str, str]:
 
 _KARAOKE_STEM_RE = re.compile(r"^[a-z_]{1,32}$")
 _karaoke_video_lock = threading.Lock()
+# job_id -> {"state": "running"|"done"|"error", "stage": str, "error": str}
+_karaoke_video_state: dict[str, dict[str, str]] = {}
 
 
 @router.post("/{job_id}/karaoke-video")
-async def render_karaoke_video(job_id: str, request: Request) -> dict[str, str]:
-    """Render what Karaoke shows (lyrics with per-word highlight over the
-    stems that are on) to an MP4, then return the URL to fetch it from."""
+async def render_karaoke_video(job_id: str, request: Request) -> JSONResponse:
+    """Start rendering what Karaoke shows (lyrics with per-word highlight over
+    the stems that are on) to an MP4 in the background. Poll
+    GET .../karaoke-video/status until it is done, then fetch .../file."""
     if not JOB_ID_RE.match(job_id):
         raise HTTPException(status_code=404, detail="job not found")
     job = registry_get(job_id)
-    if job is None or job.status != "done":
+    if job is None:
         raise HTTPException(status_code=404, detail="job not found")
     try:
         body = await request.json()
@@ -2635,19 +2638,41 @@ async def render_karaoke_video(job_id: str, request: Request) -> dict[str, str]:
     if not job_dir.is_relative_to(JOBS_DIR.resolve()):
         raise HTTPException(status_code=404, detail="job not found")
     out = job_dir / "exports" / "karaoke.mp4"
-
-    from app.pipeline.karaoke_video import KaraokeVideoError, render
+    cur = _karaoke_video_state.get(job_id)
+    if cur and cur.get("state") == "running":
+        return JSONResponse({"state": "running"}, status_code=202)
+    state = {"state": "running", "stage": "Preparando...", "error": ""}
+    _karaoke_video_state[job_id] = state
 
     def _run() -> None:
-        with _karaoke_video_lock:
-            render(job_dir / "stems", stems, lines[:2000], words[:2000], title, artist, out, semitones)
+        import traceback
 
-    try:
-        await asyncio.to_thread(_run)
-    except KaraokeVideoError as exc:
-        logger.warning("[%s] karaoke video failed: %s", job_id, exc)
-        raise HTTPException(status_code=500, detail="karaoke video failed") from None
-    return {"url": f"/api/jobs/{job_id}/karaoke-video/file?v={int(time.time())}"}
+        from app.pipeline.karaoke_video import render
+
+        try:
+            with _karaoke_video_lock:
+                out.unlink(missing_ok=True)
+                render(job_dir / "stems", stems, lines[:2000], words[:2000], title, artist,
+                       out, semitones, progress=lambda m: state.__setitem__("stage", m))
+            state["state"] = "done"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] karaoke video failed:\n%s", job_id, traceback.format_exc())
+            state["error"] = f"{type(exc).__name__}: {exc}"[:600]
+            state["state"] = "error"
+
+    threading.Thread(target=_run, name=f"karaoke-video-{job_id}", daemon=True).start()
+    return JSONResponse({"state": "running"}, status_code=202)
+
+
+@router.get("/{job_id}/karaoke-video/status")
+async def karaoke_video_status(job_id: str) -> dict[str, str]:
+    if not JOB_ID_RE.match(job_id):
+        raise HTTPException(status_code=404, detail="not found")
+    st = _karaoke_video_state.get(job_id) or {"state": "none", "stage": "", "error": ""}
+    res = dict(st)
+    if res.get("state") == "done":
+        res["url"] = f"/api/jobs/{job_id}/karaoke-video/file?v={int(time.time())}"
+    return res
 
 
 @router.get("/{job_id}/karaoke-video/file")

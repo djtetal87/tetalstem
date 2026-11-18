@@ -118,15 +118,19 @@ def _duration(path: Path) -> float:
         return 0.0
 
 
-def _encoder() -> list[str]:
+def _encoders() -> list[list[str]]:
+    """Video encoders to try, best first. Each is tried in turn until one
+    actually encodes: a listed encoder can still fail on a given machine."""
     r = subprocess.run([ffmpeg_executable(), "-hide_banner", "-encoders"],
                        capture_output=True, text=True, errors="replace")
     enc = r.stdout
-    if "h264_videotoolbox" in enc:
-        return ["-c:v", "h264_videotoolbox", "-b:v", "5M", "-allow_sw", "1"]
+    out = []
     if "libx264" in enc:
-        return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]
-    return ["-c:v", "mpeg4", "-q:v", "3"]
+        out.append(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"])
+    if "h264_videotoolbox" in enc:
+        out.append(["-c:v", "h264_videotoolbox", "-b:v", "5M", "-pix_fmt", "yuv420p"])
+    out.append(["-c:v", "mpeg4", "-q:v", "3", "-pix_fmt", "yuv420p"])
+    return out
 
 
 # ── drawing ──
@@ -270,50 +274,74 @@ def _clean(lines, words):
     return [out_l[k] for k in order], [out_w[k] for k in order]
 
 
-def render(stems_dir: Path, names: list[str], lines, words, title: str, artist: str,
-           out: Path, semitones: int = 0) -> Path:
+def _encode(lines, words, bg, dur: float, audio: Path, part: Path, venc: list[str]) -> str:
+    """Draw every frame and pipe it to ffmpeg with `venc`. Returns "" on
+    success, else ffmpeg's error text."""
     import numpy as np
 
+    cmd = [
+        ffmpeg_executable(), "-nostdin", "-y", "-loglevel", "error",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-",
+        "-i", str(audio),
+        "-map", "0:v:0", "-map", "1:a:0",
+        *venc,
+        "-c:a", "copy", "-shortest", "-movflags", "+faststart",
+        str(part),
+    ]
+    errf = tempfile.TemporaryFile()
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=errf)
+    cache_key, cache_arr = None, None
+    bar_y0, bar_y1, bar_x0, bar_x1 = H - 40, H - 34, 48, W - 48
+    total = int(math.ceil(dur * FPS))
+    try:
+        assert proc.stdin is not None
+        for n in range(total):
+            t = n / FPS
+            st = _state(lines, words, t)
+            if st != cache_key:
+                cache_key = st
+                cache_arr = np.asarray(_render_state(bg, lines, words, st).convert("RGB"), dtype=np.uint8)
+            frame = cache_arr.copy()
+            frame[bar_y0:bar_y1, bar_x0:bar_x1] = (60, 40, 80)
+            done = bar_x0 + int((bar_x1 - bar_x0) * min(1.0, t / dur))
+            frame[bar_y0:bar_y1, bar_x0:done] = SUNG
+            proc.stdin.write(frame.tobytes())
+        proc.stdin.close()
+    except (BrokenPipeError, OSError):
+        pass
+    rc = proc.wait()
+    errf.seek(0)
+    err = errf.read().decode("utf-8", "replace")
+    errf.close()
+    if rc != 0 or not part.is_file() or part.stat().st_size < 1000:
+        return err[-600:] or f"ffmpeg exit {rc}"
+    return ""
+
+
+def render(stems_dir: Path, names: list[str], lines, words, title: str, artist: str,
+           out: Path, semitones: int = 0, progress=None) -> Path:
     lines, words = _clean(lines, words)
     out.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".kv-", dir=out.parent) as tmp:
         audio = Path(tmp) / "mix.m4a"
+        if progress:
+            progress("Mezclando el audio...")
         dur = mix_audio(stems_dir, names, audio, semitones)
         if dur <= 0:
             raise KaraokeVideoError("could not read the mixed audio's length")
         bg = _background(title or "Karaoke", artist or "")
-        part = out.with_suffix(".part.mp4")
-        cmd = [
-            ffmpeg_executable(), "-nostdin", "-y", "-loglevel", "error",
-            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-",
-            "-i", str(audio),
-            *_encoder(),
-            "-pix_fmt", "yuv420p", "-c:a", "copy", "-shortest", "-movflags", "+faststart",
-            str(part),
-        ]
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-        cache_key, cache_arr = None, None
-        bar_y0, bar_y1, bar_x0, bar_x1 = H - 40, H - 34, 48, W - 48
-        total = int(math.ceil(dur * FPS))
-        try:
-            assert proc.stdin is not None
-            for n in range(total):
-                t = n / FPS
-                st = _state(lines, words, t)
-                if st != cache_key:
-                    cache_key = st
-                    cache_arr = np.asarray(_render_state(bg, lines, words, st), dtype=np.uint8)
-                frame = cache_arr.copy()
-                frame[bar_y0:bar_y1, bar_x0:bar_x1] = (60, 40, 80)
-                done = bar_x0 + int((bar_x1 - bar_x0) * min(1.0, t / dur))
-                frame[bar_y0:bar_y1, bar_x0:done] = SUNG
-                proc.stdin.write(frame.tobytes())
-            proc.stdin.close()
-        except BrokenPipeError:
-            pass
-        err = proc.stderr.read().decode("utf-8", "replace") if proc.stderr else ""
-        rc = proc.wait()
-        if rc != 0 or not part.is_file():
-            raise KaraokeVideoError(f"video encode failed: {err[-400:]}")
-        part.replace(out)
-    return out
+        part = Path(tmp) / "video.mp4"
+        errors = []
+        for venc in _encoders():
+            if progress:
+                progress(f"Creando el video ({venc[1]})...")
+            err = _encode(lines, words, bg, dur, audio, part, venc)
+            if not err:
+                import shutil
+
+                shutil.move(str(part), str(out))
+                return out
+            logger.warning("karaoke video: encoder %s failed: %s", venc[1], err)
+            errors.append(f"{venc[1]}: {err.strip()[-200:]}")
+            part.unlink(missing_ok=True)
+        raise KaraokeVideoError("video encode failed -- " + " | ".join(errors))

@@ -81,12 +81,50 @@ def _text_w(draw, text: str, f) -> float:
 # ── audio ──
 
 
-def mix_audio(stems_dir: Path, names: list[str], out: Path, semitones: int = 0) -> float:
+_BASE = ("vocals", "drums", "bass", "guitar", "piano", "other")
+
+
+def resolve_paths(stems_dir: Path, names: list[str], lanes: list[str] | None = None) -> list[Path]:
+    """The files to mix for the lanes in `names`.
+
+    "Original" is not always a file on disk: it can be the sum of every base
+    stem that has no lane of its own. When original.* is missing it is
+    rebuilt here from those stems, the same way the studio plays it."""
+    lanes_all = set(lanes or names)
+    out: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(p: Path) -> None:
+        if p.is_file() and p not in seen:
+            seen.add(p)
+            out.append(p)
+
+    for n in names:
+        p = stem_path(stems_dir, n)
+        if p.is_file():
+            add(p)
+            continue
+        if n == "original":
+            split = {"lead_vocals", "backing_vocals"} & lanes_all
+            for comp in _BASE:
+                if comp in lanes_all or (comp == "vocals" and split):
+                    continue
+                add(stem_path(stems_dir, comp))
+    return out
+
+
+def mix_audio(stems_dir: Path, names: list[str], out: Path, semitones: int = 0,
+              lanes: list[str] | None = None) -> float:
     """Mix the chosen stems into `out` (AAC). Returns the duration in s."""
-    paths = [stem_path(stems_dir, n) for n in names]
-    paths = [p for p in paths if p.is_file()]
+    paths = resolve_paths(stems_dir, names, lanes)
     if not paths:
-        raise KaraokeVideoError("no stems to mix")
+        try:
+            on_disk = sorted(p.name for p in stems_dir.iterdir() if not p.name.startswith("."))
+        except OSError:
+            on_disk = ["(no folder)"]
+        raise KaraokeVideoError(
+            f"no stems to mix (asked {names}, folder has {on_disk[:12]})"
+        )
     cmd = [ffmpeg_executable(), "-nostdin", "-y", "-loglevel", "error"]
     for p in paths:
         cmd += ["-i", str(p)]
@@ -319,14 +357,14 @@ def _encode(lines, words, bg, dur: float, audio: Path, part: Path, venc: list[st
 
 
 def render(stems_dir: Path, names: list[str], lines, words, title: str, artist: str,
-           out: Path, semitones: int = 0, progress=None) -> Path:
+           out: Path, semitones: int = 0, progress=None, lanes: list[str] | None = None) -> Path:
     lines, words = _clean(lines, words)
     out.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".kv-", dir=out.parent) as tmp:
         audio = Path(tmp) / "mix.m4a"
         if progress:
             progress("Mezclando el audio...")
-        dur = mix_audio(stems_dir, names, audio, semitones)
+        dur = mix_audio(stems_dir, names, audio, semitones, lanes)
         if dur <= 0:
             raise KaraokeVideoError("could not read the mixed audio's length")
         bg = _background(title or "Karaoke", artist or "")

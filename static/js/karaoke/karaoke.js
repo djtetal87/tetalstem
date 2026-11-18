@@ -626,6 +626,7 @@ async function exportKaraokeVideo(btn, label) {
   const safe = (meta.title || "karaoke").replace(/[\\/:*?"<>|]+/g, " ").trim().slice(0, 80) || "karaoke";
   const body = {
     stems,
+    lanes: [...presentLanes()],
     lines: lyr.lines.map((l) => ({ time: l.time, text: l.text })),
     words: lyr.words.map((ws) => (ws || []).map((w) => ({ text: w.text, start: w.start }))),
     title: meta.title,

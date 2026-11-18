@@ -2626,6 +2626,7 @@ async def render_karaoke_video(job_id: str, request: Request) -> JSONResponse:
     stems = [s for s in (body.get("stems") or []) if isinstance(s, str) and _KARAOKE_STEM_RE.match(s)]
     if not stems:
         raise HTTPException(status_code=422, detail="no stems selected")
+    lanes_all = [s for s in (body.get("lanes") or []) if isinstance(s, str) and _KARAOKE_STEM_RE.match(s)]
     lines = body.get("lines") if isinstance(body.get("lines"), list) else []
     words = body.get("words") if isinstance(body.get("words"), list) else []
     title = str(body.get("title") or getattr(job, "title", "") or "Karaoke")[:120]
@@ -2653,7 +2654,8 @@ async def render_karaoke_video(job_id: str, request: Request) -> JSONResponse:
             with _karaoke_video_lock:
                 out.unlink(missing_ok=True)
                 render(job_dir / "stems", stems, lines[:2000], words[:2000], title, artist,
-                       out, semitones, progress=lambda m: state.__setitem__("stage", m))
+                       out, semitones, progress=lambda m: state.__setitem__("stage", m),
+                       lanes=lanes_all or None)
             state["state"] = "done"
         except Exception as exc:  # noqa: BLE001
             logger.warning("[%s] karaoke video failed:\n%s", job_id, traceback.format_exc())
